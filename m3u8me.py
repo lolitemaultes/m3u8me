@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QStyle, QStyleFactory, QToolTip
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt5.QtGui import QPalette, QColor, QFont, QIcon
+from PyQt5.QtGui import QPalette, QColor, QFont, QIcon, QPixmap
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, 
@@ -813,26 +813,27 @@ class M3U8StreamDownloader(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-
-        # Add header with version
-        header_layout = QHBoxLayout()
-        header_label = QLabel("M3U8 Stream Downloader")
-        header_label.setStyleSheet("""
-            font-size: 24px;
-            font-weight: bold;
-            color: #2979ff;
-            padding: 10px;
-        """)
-        header_label.setAlignment(Qt.AlignCenter)
+    
+        # Add logo only
+        logo_container = QWidget()
+        logo_container.setFixedHeight(100)  # Adjust height as needed
+        logo_layout = QHBoxLayout(logo_container)
         
-        version_label = QLabel("v2.0")
-        version_label.setStyleSheet("color: #666666; padding: 10px;")
-        version_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # Create and configure logo label
+        logo_label = QLabel()
+        logo_pixmap = QPixmap("logo.png")
+        # Scale the logo while maintaining aspect ratio
+        scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        logo_label.setPixmap(scaled_pixmap)
+        logo_label.setAlignment(Qt.AlignCenter)
         
-        header_layout.addWidget(header_label, stretch=1)
-        header_layout.addWidget(version_label)
-        layout.addLayout(header_layout)
-
+        # Center the logo
+        logo_layout.addStretch()
+        logo_layout.addWidget(logo_label)
+        logo_layout.addStretch()
+        
+        layout.addWidget(logo_container)
+    
         # Main content
         self.tab_widget = QTabWidget()
         self.download_tab = QWidget()
@@ -842,7 +843,7 @@ class M3U8StreamDownloader(QMainWindow):
         self.tab_widget.addTab(self.settings_tab, "Settings")
         
         layout.addWidget(self.tab_widget)
-
+    
         self.init_download_tab()
         self.setup_status_bar()
 
