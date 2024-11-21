@@ -381,38 +381,73 @@ class StreamDownloader(QThread):
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def combine_segments(self, segment_files, output_file):
-        """Combine segments into final video file."""
+        """Combine segments into final video file with improved smoothness."""
         try:
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
-
+    
+            # Create concat file
             concat_file = os.path.join(self.temp_dir, 'concat.txt')
             with open(concat_file, 'w', encoding='utf-8') as f:
                 for segment in segment_files:
                     f.write(f"file '{segment}'\n")
-
+    
             output_format = self.settings.get('output_format', 'mp4')
             output_file = f"{output_file}.{output_format}"
-
+    
+            # Single pass with optimized parameters
             cmd = [
                 'ffmpeg', '-y',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', concat_file,
-                '-c', 'copy',  # Use copy to maintain original quality and speed up processing
-                '-bsf:a', 'aac_adtstoasc',  # Fix for AAC audio
-                '-movflags', '+faststart'
+                '-c:v', 'libx264',      # Use H.264 codec
+                '-preset', 'medium',     # Balance between speed and quality
+                '-crf', '23',           # Constant rate factor (18-28 is good, lower is better quality)
+                '-c:a', 'aac',          # AAC audio codec
+                '-b:a', '192k',         # Higher audio bitrate for better quality
+                '-vsync', 'cfr',        # Constant frame rate
+                '-maxrate', '5000k',    
+                '-bufsize', '10000k',
+                '-movflags', '+faststart',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-vf', 'format=yuv420p'  # Ensure compatibility
             ]
-
+    
+            # Add format-specific optimizations
+            if output_format == 'mp4':
+                cmd.extend([
+                    '-tune', 'film',     # Optimize for video content
+                    '-map', '0:v:0',     # Map first video stream
+                    '-map', '0:a:0?',    # Map first audio stream if it exists
+                ])
+            elif output_format == 'mkv':
+                cmd.extend([
+                    '-map', '0',         # Map all streams for MKV
+                ])
+    
             cmd.append(output_file)
-
-            process = subprocess.run(cmd, capture_output=True, text=True)
-            
-            # Verify the output file exists and has content
+    
+            # Run FFmpeg
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+    
+            if process.returncode != 0:
+                error_msg = process.stderr.strip()
+                raise Exception(f"FFmpeg error: {error_msg}")
+    
+            # Verify the output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
                 raise Exception("Output file is missing or too small")
-
+    
             return True
+    
         except Exception as e:
             logger.error(f"Error combining segments: {str(e)}")
             return False
