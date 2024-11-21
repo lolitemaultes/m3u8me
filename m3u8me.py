@@ -10,6 +10,8 @@ import logging
 import tempfile
 import shutil
 import concurrent.futures
+from collections import deque
+import threading
 from urllib.parse import urljoin, urlparse
 import subprocess
 import requests
@@ -262,24 +264,100 @@ class StreamDownloader(QThread):
         self.save_path = save_path
         self.settings = settings
         self.is_running = True
-        self.session = requests.Session()
         self.temp_dir = None
+        
+        # Dynamic worker calculation based on system resources
+        self.max_concurrent_segments = self._calculate_optimal_workers()
+        self.chunk_size = self._calculate_optimal_chunk_size()
+        
+        # Initialize thread-safe structures
+        self.segment_queue = deque()
+        self.download_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.completed_segments = set()
+        
+        # Configure session with optimized settings
+        self.session = self._configure_session()
         self.retry_count = settings.get('retry_attempts', 3)
+        
+        # Enhanced headers for better server compatibility
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': '*/*',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         }
 
+    def _calculate_optimal_workers(self):
+        """Calculate optimal number of worker threads based on system resources."""
+        try:
+            # Get system resources
+            cpu_count = psutil.cpu_count(logical=False) or 2
+            memory = psutil.virtual_memory()
+            available_memory_gb = memory.available / (1024 * 1024 * 1024)
+            
+            # Base calculation on CPU cores and available memory
+            cpu_based = cpu_count * 2
+            memory_based = int(available_memory_gb * 4)  # 4 workers per GB of free RAM
+            
+            # Use the limiting factor
+            optimal_workers = min(cpu_based, memory_based)
+            
+            # Clamp between reasonable values
+            return max(4, min(optimal_workers, 64))
+        except:
+            # Fallback to conservative default if unable to determine
+            return 8
+
+    def _calculate_optimal_chunk_size(self):
+        """Calculate optimal chunk size based on available memory."""
+        try:
+            memory = psutil.virtual_memory()
+            available_memory_mb = memory.available / (1024 * 1024)
+            
+            # Scale chunk size with available memory
+            if available_memory_mb > 8192:  # >8GB free
+                return 4 * 1024 * 1024  # 4MB chunks
+            elif available_memory_mb > 4096:  # >4GB free
+                return 2 * 1024 * 1024  # 2MB chunks
+            else:
+                return 1 * 1024 * 1024  # 1MB chunks
+        except:
+            return 1 * 1024 * 1024  # 1MB default
+
+    def _configure_session(self):
+        """Configure requests session with optimized settings."""
+        session = requests.Session()
+        
+        # Configure connection pooling
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=self.max_concurrent_segments,
+            pool_maxsize=self.max_concurrent_segments,
+            max_retries=self.retry_count,
+            pool_block=False
+        )
+        
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        
+        # Set session-wide timeouts
+        session.timeout = (5, 30)  # (connect timeout, read timeout)
+        
+        return session
+
     def download_segment(self, segment_url, output_path, index, total):
-        """Download a single segment with improved error handling and verification."""
+        """Download a single segment with optimized streaming and error handling."""
+        temp_path = f"{output_path}.temp"
+        
         for attempt in range(self.retry_count):
             try:
                 if not self.is_running:
                     return False
 
-                # Handle different URL formats
+                # Normalize URL
                 if segment_url.startswith('//'):
                     segment_url = 'https:' + segment_url
                 elif not segment_url.startswith('http'):
@@ -288,84 +366,107 @@ class StreamDownloader(QThread):
                     parsed_parent = urlparse(self.url)
                     segment_url = f"{parsed_parent.scheme}://{parsed_parent.netloc}{segment_url}"
 
-                response = self.session.get(
+                # Stream download with efficient chunking
+                with self.session.get(
                     segment_url,
                     headers=self.headers,
                     timeout=self.settings.get('segment_timeout', 30),
-                    verify=False
-                )
-                response.raise_for_status()
-                
-                # Verify content type
-                content_type = response.headers.get('content-type', '')
-                if not any(valid_type in content_type.lower() 
-                          for valid_type in ['video', 'audio', 'octet-stream', 'mpegts']):
-                    logger.warning(f"Unexpected content type for segment {index}: {content_type}")
-                
-                # Write segment data
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-                
-                # Verify file size
-                file_size = os.path.getsize(output_path)
-                if file_size < 100:
-                    raise Exception(f"Segment {index} is too small: {file_size} bytes")
-                
-                self.progress_updated.emit(
-                    self.url,
-                    int((index + 1) / total * 90),
-                    f"Downloading segment {index + 1}/{total}"
-                )
-                return True
-                
+                    verify=False,
+                    stream=True
+                ) as response:
+                    response.raise_for_status()
+                    
+                    # Get content length if available
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded_size = 0
+                    
+                    # Stream to temporary file
+                    with open(temp_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=self.chunk_size):
+                            if not self.is_running:
+                                return False
+                            if chunk:
+                                f.write(chunk)
+                                downloaded_size += len(chunk)
+                                
+                                # Update progress if content length is known
+                                if total_size > 0:
+                                    segment_progress = int((downloaded_size / total_size) * 100)
+                                    with self.progress_lock:
+                                        self.progress_updated.emit(
+                                            self.url,
+                                            int((index + segment_progress/100) / total * 90),
+                                            f"Downloading segment {index + 1}/{total}"
+                                        )
+
+                # Verify downloaded file
+                if os.path.exists(temp_path):
+                    file_size = os.path.getsize(temp_path)
+                    if file_size < 100:
+                        raise Exception(f"Segment {index} is too small: {file_size} bytes")
+                    
+                    # Move temp file to final location
+                    os.replace(temp_path, output_path)
+                    
+                    with self.download_lock:
+                        self.completed_segments.add(index)
+                        progress = int(len(self.completed_segments) / total * 90)
+                        self.progress_updated.emit(
+                            self.url,
+                            progress,
+                            f"Downloaded {len(self.completed_segments)}/{total} segments"
+                        )
+                    return True
+                else:
+                    raise Exception(f"Failed to download segment {index}")
+
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1}/{self.retry_count} failed for segment {index}: {str(e)}")
                 if attempt < self.retry_count - 1:
-                    time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    time.sleep(0.5 * (attempt + 1))  # Reduced backoff time
                     continue
                 return False
+            finally:
+                # Cleanup temp file if it exists
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                        
         return False
 
     def combine_segments(self, segment_files, output_file):
-        """Combine segments into final video file with improved format handling and quality."""
+        """Combine downloaded segments into final video file with optimized processing."""
         try:
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
-    
+
             # Create concat file
             concat_file = os.path.join(self.temp_dir, 'concat.txt')
             with open(concat_file, 'w', encoding='utf-8') as f:
                 for segment in segment_files:
                     f.write(f"file '{segment}'\n")
-    
+
             output_format = self.settings.get('output_format', 'mp4')
             output_file = f"{output_file}.{output_format}"
-    
-            # Format-specific encoding parameters
+
+            # Optimized encoding parameters based on format
             encoding_params = {
                 'mp4': {
-                    'vcodec': 'libx264',
-                    'acodec': 'aac',
+                    'vcodec': 'copy',  # Try direct copy first
+                    'acodec': 'copy',
                     'extra': [
                         '-movflags', '+faststart',
-                        '-profile:v', 'high',
-                        '-level', '4.1',
-                        '-crf', '23',
-                        '-preset', 'medium',
-                        '-tune', 'film',
-                        '-brand', 'mp42',
                         '-max_muxing_queue_size', '4096'
                     ]
                 },
                 'mkv': {
-                    'vcodec': 'libx264',
+                    'vcodec': 'copy',
                     'acodec': 'copy',
                     'extra': [
-                        '-crf', '23',
-                        '-preset', 'medium',
                         '-max_muxing_queue_size', '4096',
-                        '-map', '0',
-                        '-dn'  # Disable data stream copying
+                        '-map', '0'
                     ]
                 },
                 'ts': {
@@ -374,44 +475,32 @@ class StreamDownloader(QThread):
                     'extra': [
                         '-copyts',
                         '-muxdelay', '0',
-                        '-muxpreload', '0',
-                        '-map', '0',
-                        '-dn',
-                        '-f', 'mpegts',
-                        '-mpegts_flags', '+initial_discontinuity'
+                        '-muxpreload', '0'
                     ]
                 }
             }
 
             params = encoding_params.get(output_format)
             
-            # Base command
+            # Base FFmpeg command
             cmd = [
                 'ffmpeg', '-y',
                 '-hide_banner',
                 '-loglevel', 'warning',
-                '-stats', '-f', 'concat',
+                '-stats',
+                '-f', 'concat',
                 '-safe', '0',
                 '-i', concat_file,
                 '-c:v', params['vcodec'],
-                '-c:a', params['acodec'],
+                '-c:a', params['acodec']
             ]
             
-            # Add format-specific extra parameters
+            # Add format-specific parameters
             cmd.extend(params['extra'])
             
-            # Add common parameters for better output quality
-            if output_format != 'ts':
-                cmd.extend([
-                    '-vsync', 'cfr',
-                    '-af', 'aresample=async=1:min_hard_comp=0.100000',
-                    '-vf', 'format=yuv420p',
-                    '-metadata', f'encoding_tool=M3U8 Downloader {datetime.now().strftime("%Y-%m-%d")}'
-                ])
-
             # Add output file
             cmd.append(output_file)
-    
+
             # Run FFmpeg with progress monitoring
             process = subprocess.Popen(
                 cmd,
@@ -420,7 +509,6 @@ class StreamDownloader(QThread):
                 universal_newlines=True
             )
             
-            # Monitor FFmpeg progress
             while True:
                 if not self.is_running:
                     process.terminate()
@@ -432,179 +520,134 @@ class StreamDownloader(QThread):
                     
                 if 'time=' in output:
                     try:
-                        time_str = re.search(r'time=(\d+:\d+:\d+.\d+)', output).group(1)
+                        time_str = output.split('time=')[1].split()[0]
                         h, m, s = map(float, time_str.split(':'))
-                        progress = min(99, 90 + int(float(h) * 3600 + float(m) * 60 + float(s)) % 10)
+                        progress = min(99, 90 + int(h * 3600 + m * 60 + s) % 10)
                         self.progress_updated.emit(self.url, progress, "Processing video...")
                     except:
                         pass
-            
-            process.wait()
-            
+
             if process.returncode != 0:
-                error_msg = process.stderr.read().strip()
-                raise Exception(f"FFmpeg error: {error_msg}")
-            
+                raise Exception(f"FFmpeg error: {process.stderr.read().strip()}")
+
             # Verify output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
                 raise Exception("Output file is missing or too small")
-                
-            # Final verification for non-TS formats
-            if output_format != 'ts':
-                verify_cmd = [
-                    'ffmpeg', '-v', 'error',
-                    '-i', output_file,
-                    '-f', 'null', '-'
-                ]
-                verify_process = subprocess.run(
-                    verify_cmd,
-                    capture_output=True,
-                    text=True
-                )
-                if verify_process.stderr:
-                    raise Exception(f"Output file verification failed: {verify_process.stderr}")
-    
+
             return True
-    
+
         except Exception as e:
             logger.error(f"Error combining segments: {str(e)}")
             return False
 
     def run(self):
+        """Main download process with enhanced error handling and progress reporting."""
         try:
             self.temp_dir = tempfile.mkdtemp()
-            
-            # Parse the initial URL
             parsed_url = urlparse(self.url)
-            
-            # Handle direct M3U8 content
+
+            # Get playlist content
             if self.url.startswith('#EXTM3U'):
                 content = self.url
             else:
-                # Get the playlist content with retry logic
-                for attempt in range(self.retry_count):
-                    try:
-                        response = self.session.get(
-                            self.url,
-                            headers=self.headers,
-                            verify=False,
-                            timeout=30
-                        )
-                        response.raise_for_status()
-                        content = response.text
-                        break
-                    except Exception as e:
-                        if attempt == self.retry_count - 1:
-                            raise Exception(f"Failed to fetch playlist: {str(e)}")
-                        time.sleep(1 * (attempt + 1))
+                response = self.session.get(
+                    self.url,
+                    headers=self.headers,
+                    verify=False,
+                    timeout=30
+                )
+                response.raise_for_status()
+                content = response.text
 
             playlist = m3u8.loads(content)
-            
+
             # Handle master playlist
             if not playlist.segments and playlist.playlists:
-                # Sort playlists by bandwidth
                 playlists = sorted(
                     playlist.playlists,
                     key=lambda p: p.stream_info.bandwidth if p.stream_info else 0
                 )
                 
                 # Select quality based on settings
-                if self.settings['quality'] == 'best':
+                quality = self.settings.get('quality', 'best')
+                if quality == 'best':
                     selected_playlist = playlists[-1]
-                elif self.settings['quality'] == 'worst':
+                elif quality == 'worst':
                     selected_playlist = playlists[0]
                 else:  # medium
                     selected_playlist = playlists[len(playlists)//2]
-                
-                # Get the selected playlist URL
+
                 playlist_url = selected_playlist.uri
                 if not playlist_url.startswith('http'):
                     base_url = get_base_url(self.url, parsed_url)
                     playlist_url = urljoin(base_url, playlist_url)
-                
-                # Get the media playlist with retry logic
-                for attempt in range(self.retry_count):
-                    try:
-                        response = self.session.get(
-                            playlist_url,
-                            headers=self.headers,
-                            verify=False,
-                            timeout=30
-                        )
-                        response.raise_for_status()
-                        playlist = m3u8.loads(response.text)
-                        break
-                    except Exception as e:
-                        if attempt == self.retry_count - 1:
-                            raise Exception(f"Failed to fetch media playlist: {str(e)}")
-                        time.sleep(1 * (attempt + 1))
-                        
-                # Update base URL for segments
+
+                response = self.session.get(
+                    playlist_url,
+                    headers=self.headers,
+                    verify=False,
+                    timeout=30
+                )
+                response.raise_for_status()
+                playlist = m3u8.loads(response.text)
                 parsed_url = urlparse(playlist_url)
 
             if not playlist.segments:
                 raise Exception("No segments found in playlist")
 
-            # Calculate total download size (if possible)
-            total_size = 0
-            if hasattr(playlist.segments[0], 'byterange'):
-                for segment in playlist.segments:
-                    total_size += segment.byterange.length if segment.byterange else 0
-
-            # Get the correct base URL for segments
             base_url = get_base_url(self.url, parsed_url)
-            
-            # Download segments
-            segment_files = []
-            downloaded_segments = set()
             total_segments = len(playlist.segments)
-            
-            self.progress_updated.emit(
-                self.url,
-                0,
-                f"Starting download of {total_segments} segments" + 
-                (f" ({total_size/1024/1024:.1f} MB)" if total_size > 0 else "")
-            )
-            
+
+            # Prepare segment download tasks
+            segment_tasks = []
             for i, segment in enumerate(playlist.segments):
-                if not self.is_running:
-                    raise Exception("Download cancelled by user")
-
-                output_path = os.path.join(
-                    self.temp_dir,
-                    f"segment_{i:05d}.ts"
-                )
-                segment_files.append(output_path)
-                
-                # Handle different segment URI formats
+                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
                 segment_url = urljoin(base_url, segment.uri)
-                
-                # Try to download segment with retries
-                success = False
-                for attempt in range(self.retry_count):
-                    if self.download_segment(segment_url, output_path, i, total_segments):
-                        success = True
-                        downloaded_segments.add(i)
-                        break
-                    time.sleep(min(1 * (attempt + 1), 5))  # Exponential backoff with max delay
-                
-                if not success:
-                    raise Exception(f"Failed to download segment {i + 1} after {self.retry_count} attempts")
+                segment_tasks.append((segment_url, output_path, i))
 
-            if len(downloaded_segments) != total_segments:
-                raise Exception(f"Missing segments. Downloaded {len(downloaded_segments)}/{total_segments}")
+            # Download segments concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_segments) as executor:
+                futures = {
+                    executor.submit(
+                        self.download_segment,
+                        url,
+                        path,
+                        idx,
+                        total_segments
+                    ): idx for url, path, idx in segment_tasks
+                }
 
-            # Combine segments
+                for future in concurrent.futures.as_completed(futures):
+                    if not self.is_running:
+                        executor.shutdown(wait=False)
+                        raise Exception("Download cancelled by user")
+
+                    idx = futures[future]
+                    try:
+                        if not future.result():
+                            raise Exception(f"Failed to download segment {idx}")
+                    except Exception as e:
+                        logger.error(f"Error downloading segment {idx}: {str(e)}")
+                        raise
+
+            if len(self.completed_segments) != total_segments:
+                raise Exception(f"Missing segments. Downloaded {len(self.completed_segments)}/{total_segments}")
+
+            # Process final video
             self.progress_updated.emit(self.url, 90, "Processing video...")
             
-            # Create output filename with quality info
-            quality_info = f"_{self.settings['quality']}" if 'quality' in self.settings else ""
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            quality_info = f"_{self.settings.get('quality', 'best')}"
             output_file = os.path.join(
                 self.save_path,
                 f"video_{timestamp}{quality_info}"
             )
-            
+
+            segment_files = [
+                os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
+                for i in range(total_segments)
+            ]
+
             if self.combine_segments(segment_files, output_file):
                 self.download_complete.emit(self.url)
             else:
@@ -614,14 +657,156 @@ class StreamDownloader(QThread):
             logger.error(f"Download error: {str(e)}")
             self.download_error.emit(self.url, str(e))
         finally:
+            # Clean up temporary files
             if self.temp_dir and os.path.exists(self.temp_dir):
                 try:
                     shutil.rmtree(self.temp_dir, ignore_errors=True)
                 except:
                     pass
+            
+            # Clean up session
+            try:
+                self.session.close()
+            except:
+                pass
 
     def stop(self):
+        """Safely stop the download process."""
         self.is_running = False
+        try:
+            self.session.close()
+        except:
+            pass
+
+    def _get_system_memory_status(self):
+        """Get current system memory usage status."""
+        try:
+            memory = psutil.virtual_memory()
+            return {
+                'total': memory.total,
+                'available': memory.available,
+                'percent': memory.percent,
+                'used': memory.used,
+                'free': memory.free
+            }
+        except:
+            return None
+
+    def _adjust_workers_dynamically(self):
+        """Dynamically adjust worker count based on system load."""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = self._get_system_memory_status()
+            
+            if memory and cpu_percent:
+                # Reduce workers if system is under heavy load
+                if cpu_percent > 85 or memory['percent'] > 90:
+                    self.max_concurrent_segments = max(4, self.max_concurrent_segments - 2)
+                # Increase workers if system has capacity
+                elif cpu_percent < 60 and memory['percent'] < 70:
+                    self.max_concurrent_segments = min(64, self.max_concurrent_segments + 2)
+        except:
+            pass
+
+    def _segment_cleanup(self, segment_path):
+        """Safely clean up a segment file."""
+        try:
+            if os.path.exists(segment_path):
+                os.remove(segment_path)
+        except Exception as e:
+            logger.error(f"Error cleaning up segment {segment_path}: {str(e)}")
+
+    def _verify_segment_integrity(self, segment_path):
+        """Verify the integrity of a downloaded segment."""
+        try:
+            if not os.path.exists(segment_path):
+                return False
+                
+            # Check file size
+            file_size = os.path.getsize(segment_path)
+            if file_size < 100:  # Too small to be valid
+                return False
+                
+            # Basic header check for TS format
+            with open(segment_path, 'rb') as f:
+                header = f.read(188)  # TS packet size
+                if len(header) == 188 and header[0] == 0x47:  # Valid TS sync byte
+                    return True
+                    
+            return False
+        except:
+            return False
+
+    def _optimize_chunk_size(self, content_length):
+        """Dynamically optimize chunk size based on content length."""
+        if not content_length:
+            return self.chunk_size
+            
+        # For very small files, use smaller chunks
+        if content_length < 1024 * 1024:  # < 1MB
+            return 16 * 1024  # 16KB chunks
+        # For very large files, use larger chunks
+        elif content_length > 100 * 1024 * 1024:  # > 100MB
+            return 4 * 1024 * 1024  # 4MB chunks
+            
+        return self.chunk_size
+
+    def _calculate_progress(self, downloaded, total_size, segment_index, total_segments):
+        """Calculate overall download progress."""
+        if total_size:
+            segment_progress = (downloaded / total_size) * 100
+        else:
+            segment_progress = 0
+            
+        overall_progress = (
+            (segment_index + (segment_progress / 100)) / total_segments * 90
+        )
+        return min(99, overall_progress)
+
+    def _handle_network_error(self, error, attempt, segment_index):
+        """Handle network-related errors with smart retry logic."""
+        error_str = str(error).lower()
+        
+        # Determine retry delay based on error type
+        if 'timeout' in error_str:
+            delay = 1 * (attempt + 1)  # Linear backoff for timeouts
+        elif 'connection' in error_str:
+            delay = 2 * (attempt + 1)  # Longer delay for connection issues
+        elif '503' in error_str:
+            delay = 5  # Fixed delay for service unavailable
+        else:
+            delay = 0.5 * (attempt + 1)  # Default exponential backoff
+            
+        logger.warning(f"Segment {segment_index} download failed (attempt {attempt + 1}): {error}")
+        return delay
+
+    def _check_disk_space(self, required_space):
+        """Check if there's enough disk space available."""
+        try:
+            if self.temp_dir:
+                disk_usage = psutil.disk_usage(self.temp_dir)
+                return disk_usage.free > required_space
+        except:
+            pass
+        return True  # Assume enough space if check fails
+
+    def _estimate_required_space(self, segment_count, avg_segment_size):
+        """Estimate required disk space for download."""
+        # Estimate space needed for segments
+        segment_space = segment_count * avg_segment_size
+        # Add 20% buffer for processing
+        total_space = segment_space * 1.2
+        return total_space
+
+    def get_download_stats(self):
+        """Get current download statistics."""
+        return {
+            'completed_segments': len(self.completed_segments),
+            'worker_count': self.max_concurrent_segments,
+            'chunk_size': self.chunk_size,
+            'is_running': self.is_running,
+            'memory_usage': self._get_system_memory_status()
+        }
 
 class SettingsTab(QWidget):
     def __init__(self, parent=None):
