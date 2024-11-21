@@ -266,6 +266,9 @@ class StreamDownloader(QThread):
         self.is_running = True
         self.temp_dir = None
         
+        # Set retry count first before configuring session
+        self.retry_count = settings.get('retry_attempts', 3)
+        
         # Dynamic worker calculation based on system resources
         self.max_concurrent_segments = self._calculate_optimal_workers()
         self.chunk_size = self._calculate_optimal_chunk_size()
@@ -278,7 +281,6 @@ class StreamDownloader(QThread):
         
         # Configure session with optimized settings
         self.session = self._configure_session()
-        self.retry_count = settings.get('retry_attempts', 3)
         
         # Enhanced headers for better server compatibility
         self.headers = {
