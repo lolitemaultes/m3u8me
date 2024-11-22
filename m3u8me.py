@@ -5,29 +5,38 @@ import os
 import json
 import re
 import time
-from datetime import datetime
 import logging
 import tempfile
 import shutil
 import concurrent.futures
-from collections import deque
 import threading
-from urllib.parse import urljoin, urlparse
 import subprocess
+import importlib.util
+from datetime import datetime
+from collections import deque
+from urllib.parse import urljoin, urlparse
+from pathlib import Path
+
 import requests
 import m3u8
+import psutil
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QProgressBar, QFileDialog, QMessageBox, QTabWidget,
     QComboBox, QSpinBox, QCheckBox, QGridLayout, QScrollArea, QFrame,
-    QGroupBox, QStyle, QStyleFactory, QToolTip
+    QGroupBox, QStyle, QStyleFactory, QToolTip, QSystemTrayIcon, QMenu
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QSize, QTimer, QSettings
+)
+from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PyQt5.QtGui import QPalette, QColor, QFont, QIcon, QPixmap
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 def get_base_url(url, parsed_url):
@@ -37,6 +46,79 @@ def get_base_url(url, parsed_url):
     if url.startswith('http'):
         return os.path.dirname(url) + '/'
     return parsed_url.scheme + '://' + parsed_url.netloc + os.path.dirname(parsed_url.path) + '/'
+
+class PluginManager:
+    def __init__(self):
+        self.plugins = {}
+        self.plugin_folder = Path("plugins")
+        self.plugin_folder.mkdir(exist_ok=True)
+        self.load_plugins()
+
+    def load_plugins(self):
+        """Load all plugins from the plugins directory."""
+        self.plugins = {}
+        for plugin_file in self.plugin_folder.glob("*.m3uplug"):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    plugin_file.stem, 
+                    plugin_file
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                if hasattr(module, 'PLUGIN_INFO'):
+                    self.plugins[plugin_file.stem] = {
+                        'module': module,
+                        'info': module.PLUGIN_INFO,
+                        'path': plugin_file
+                    }
+            except Exception as e:
+                logger.error(f"Failed to load plugin {plugin_file}: {str(e)}")
+
+    def install_plugin(self, plugin_path):
+        """Install a plugin from a file."""
+        try:
+            plugin_file = Path(plugin_path)
+            if not plugin_file.suffix == '.m3uplug':
+                raise ValueError("Invalid plugin file")
+
+            # Verify plugin structure
+            spec = importlib.util.spec_from_file_location(
+                plugin_file.stem, 
+                plugin_file
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            if not hasattr(module, 'PLUGIN_INFO'):
+                raise ValueError("Invalid plugin format")
+
+            # Copy to plugins folder
+            dest = self.plugin_folder / plugin_file.name
+            shutil.copy2(plugin_file, dest)
+            
+            return True, "Plugin installed successfully"
+        except Exception as e:
+            return False, f"Failed to install plugin: {str(e)}"
+
+    def uninstall_plugin(self, plugin_name):
+        """Uninstall a plugin."""
+        try:
+            if plugin_name in self.plugins:
+                plugin_path = self.plugins[plugin_name]['path']
+                plugin_path.unlink()
+                del self.plugins[plugin_name]
+                return True, "Plugin uninstalled successfully"
+            return False, "Plugin not found"
+        except Exception as e:
+            return False, f"Failed to uninstall plugin: {str(e)}"
+
+    def get_installed_plugins(self):
+        """Get list of installed plugins."""
+        return {
+            name: plugin['info'] 
+            for name, plugin in self.plugins.items()
+        }
 
 class CustomStyle:
     @staticmethod
@@ -61,7 +143,7 @@ class CustomStyle:
         
         app.setPalette(dark_palette)
         
-        # Enhanced stylesheet without transitions
+        # Enhanced stylesheet
         app.setStyleSheet("""
             QMainWindow {
                 background-color: #353535;
@@ -185,6 +267,146 @@ class CustomStyle:
             }
         """)
 
+class SystemTrayApp(QSystemTrayIcon):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setIcon(QIcon("icon.ico"))
+        self.setVisible(True)
+        
+        self.menu = QMenu()
+        
+        self.open_window_action = self.menu.addAction("Open Window")
+        self.open_window_action.triggered.connect(self.show_window)
+        
+        self.downloads_action = self.menu.addAction("Downloads")
+        self.downloads_action.triggered.connect(self.show_downloads)
+        
+        self.settings_action = self.menu.addAction("Settings")
+        self.settings_action.triggered.connect(self.show_settings)
+        
+        self.menu.addSeparator()
+        
+        self.quit_action = self.menu.addAction("Quit Application")
+        self.quit_action.triggered.connect(self.quit_app)
+        
+        self.setContextMenu(self.menu)
+        self.activated.connect(self.tray_activated)
+
+    def show_window(self):
+        self.parent.show()
+        self.parent.activateWindow()
+
+    def show_downloads(self):
+        self.parent.show()
+        self.parent.activateWindow()
+        self.parent.tab_widget.setCurrentIndex(0)
+
+    def show_settings(self):
+        self.parent.show()
+        self.parent.activateWindow()
+        self.parent.tab_widget.setCurrentIndex(1)
+
+    def quit_app(self):
+        self.parent.force_quit = True
+        self.parent.close()
+
+    def tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_window()
+
+class FileAssociationHandler:
+    @staticmethod
+    def setup_file_associations():
+        """Set up file associations for M3U8 files."""
+        try:
+            # Check if running on Windows
+            if sys.platform == 'win32':
+                import winreg
+                exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+                
+                # Windows registry setup
+                with winreg.CreateKey(winreg.HKEY_CLASSES_ROOT, '.m3u8') as key:
+                    winreg.SetValue(key, '', winreg.REG_SZ, 'M3U8ME.m3u8file')
+                    
+                with winreg.CreateKey(winreg.HKEY_CLASSES_ROOT, 'M3U8ME.m3u8file') as key:
+                    winreg.SetValue(key, '', winreg.REG_SZ, 'M3U8 Playlist File')
+                    
+                    with winreg.CreateKey(key, 'DefaultIcon') as icon_key:
+                        icon_path = os.path.join(os.path.dirname(exe_path), 'icon.ico')
+                        winreg.SetValue(icon_key, '', winreg.REG_SZ, icon_path)
+                    
+                    with winreg.CreateKey(key, 'shell\\open\\command') as cmd_key:
+                        cmd = f'"{exe_path}" "%1"'
+                        winreg.SetValue(cmd_key, '', winreg.REG_SZ, cmd)
+                
+                with winreg.CreateKey(winreg.HKEY_CLASSES_ROOT, 'm3u8me') as key:
+                    winreg.SetValue(key, '', winreg.REG_SZ, 'URL:M3U8ME Protocol')
+                    winreg.SetValueEx(key, 'URL Protocol', 0, winreg.REG_SZ, '')
+                    
+                    with winreg.CreateKey(key, 'DefaultIcon') as icon_key:
+                        icon_path = os.path.join(os.path.dirname(exe_path), 'icon.ico')
+                        winreg.SetValue(icon_key, '', winreg.REG_SZ, icon_path)
+                    
+                    with winreg.CreateKey(key, 'shell\\open\\command') as cmd_key:
+                        cmd = f'"{exe_path}" "%1"'
+                        winreg.SetValue(cmd_key, '', winreg.REG_SZ, cmd)
+            
+            elif sys.platform == 'linux':
+                # Linux desktop entry setup
+                exe_path = os.path.abspath(sys.argv[0])
+                icon_path = os.path.join(os.path.dirname(exe_path), 'icon.png')
+                desktop_dir = os.path.expanduser('~/.local/share/applications')
+                os.makedirs(desktop_dir, exist_ok=True)
+                
+                desktop_entry = f"""[Desktop Entry]
+Name=M3U8ME
+Comment=M3U8 Stream Downloader
+Exec={exe_path} %f
+Icon={icon_path}
+Terminal=false
+Type=Application
+Categories=AudioVideo;Network;
+MimeType=application/x-mpegURL;x-scheme-handler/m3u8me;
+"""
+                
+                desktop_file = os.path.join(desktop_dir, 'm3u8me.desktop')
+                with open(desktop_file, 'w') as f:
+                    f.write(desktop_entry)
+                
+                # Update MIME database
+                mime_dir = os.path.expanduser('~/.local/share/mime/packages')
+                os.makedirs(mime_dir, exist_ok=True)
+                
+                mime_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-mpegURL">
+    <comment>M3U8 Playlist</comment>
+    <glob pattern="*.m3u8"/>
+  </mime-type>
+</mime-info>
+"""
+                
+                mime_file = os.path.join(mime_dir, 'm3u8me.xml')
+                with open(mime_file, 'w') as f:
+                    f.write(mime_xml)
+                
+                # Update databases
+                subprocess.run(['update-mime-database', os.path.expanduser('~/.local/share/mime')], check=False)
+                subprocess.run(['update-desktop-database', desktop_dir], check=False)
+                
+            elif sys.platform == 'darwin':
+                # macOS associations setup
+                # Note: macOS associations typically require app bundling
+                logger.warning("File associations on macOS require app bundling")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to set up file associations: {str(e)}")
+            return False
+
 class DownloadWidget(QFrame):
     def __init__(self, url, parent=None):
         super().__init__(parent)
@@ -210,7 +432,6 @@ class DownloadWidget(QFrame):
         # URL and status layout
         info_layout = QVBoxLayout()
         
-        # Truncate long URLs
         display_url = self.url[:50] + '...' if len(self.url) > 50 else self.url
         self.url_label = QLabel(display_url)
         self.url_label.setToolTip(self.url)
@@ -222,7 +443,6 @@ class DownloadWidget(QFrame):
         info_layout.addWidget(self.url_label)
         info_layout.addWidget(self.status_label)
         
-        # Progress bar with enhanced styling
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setAlignment(Qt.AlignCenter)
@@ -240,7 +460,6 @@ class DownloadWidget(QFrame):
             }
         """)
         
-        # Cancel button with icon - Fixed icon setting
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setFixedWidth(80)
         self.cancel_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserStop))
@@ -265,24 +484,15 @@ class StreamDownloader(QThread):
         self.settings = settings
         self.is_running = True
         self.temp_dir = None
-        
-        # Set retry count first before configuring session
         self.retry_count = settings.get('retry_attempts', 3)
-        
-        # Dynamic worker calculation based on system resources
         self.max_concurrent_segments = self._calculate_optimal_workers()
         self.chunk_size = self._calculate_optimal_chunk_size()
-        
-        # Initialize thread-safe structures
         self.segment_queue = deque()
         self.download_lock = threading.Lock()
         self.progress_lock = threading.Lock()
         self.completed_segments = set()
-        
-        # Configure session with optimized settings
         self.session = self._configure_session()
         
-        # Enhanced headers for better server compatibility
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': '*/*',
@@ -294,64 +504,44 @@ class StreamDownloader(QThread):
         }
 
     def _calculate_optimal_workers(self):
-        """Calculate optimal number of worker threads based on system resources."""
         try:
-            # Get system resources
             cpu_count = psutil.cpu_count(logical=False) or 2
             memory = psutil.virtual_memory()
             available_memory_gb = memory.available / (1024 * 1024 * 1024)
-            
-            # Base calculation on CPU cores and available memory
             cpu_based = cpu_count * 2
-            memory_based = int(available_memory_gb * 4)  # 4 workers per GB of free RAM
-            
-            # Use the limiting factor
+            memory_based = int(available_memory_gb * 4)
             optimal_workers = min(cpu_based, memory_based)
-            
-            # Clamp between reasonable values
             return max(4, min(optimal_workers, 64))
         except:
-            # Fallback to conservative default if unable to determine
             return 8
 
     def _calculate_optimal_chunk_size(self):
-        """Calculate optimal chunk size based on available memory."""
         try:
             memory = psutil.virtual_memory()
             available_memory_mb = memory.available / (1024 * 1024)
-            
-            # Scale chunk size with available memory
-            if available_memory_mb > 8192:  # >8GB free
-                return 4 * 1024 * 1024  # 4MB chunks
-            elif available_memory_mb > 4096:  # >4GB free
-                return 2 * 1024 * 1024  # 2MB chunks
+            if available_memory_mb > 8192:
+                return 4 * 1024 * 1024
+            elif available_memory_mb > 4096:
+                return 2 * 1024 * 1024
             else:
-                return 1 * 1024 * 1024  # 1MB chunks
+                return 1 * 1024 * 1024
         except:
-            return 1 * 1024 * 1024  # 1MB default
+            return 1 * 1024 * 1024
 
     def _configure_session(self):
-        """Configure requests session with optimized settings."""
         session = requests.Session()
-        
-        # Configure connection pooling
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=self.max_concurrent_segments,
             pool_maxsize=self.max_concurrent_segments,
             max_retries=self.retry_count,
             pool_block=False
         )
-        
         session.mount('http://', adapter)
         session.mount('https://', adapter)
-        
-        # Set session-wide timeouts
-        session.timeout = (5, 30)  # (connect timeout, read timeout)
-        
+        session.timeout = (5, 30)
         return session
 
     def download_segment(self, segment_url, output_path, index, total):
-        """Download a single segment with optimized streaming and error handling."""
         temp_path = f"{output_path}.temp"
         
         for attempt in range(self.retry_count):
@@ -359,7 +549,6 @@ class StreamDownloader(QThread):
                 if not self.is_running:
                     return False
 
-                # Normalize URL
                 if segment_url.startswith('//'):
                     segment_url = 'https:' + segment_url
                 elif not segment_url.startswith('http'):
@@ -368,7 +557,6 @@ class StreamDownloader(QThread):
                     parsed_parent = urlparse(self.url)
                     segment_url = f"{parsed_parent.scheme}://{parsed_parent.netloc}{segment_url}"
 
-                # Stream download with efficient chunking
                 with self.session.get(
                     segment_url,
                     headers=self.headers,
@@ -377,12 +565,9 @@ class StreamDownloader(QThread):
                     stream=True
                 ) as response:
                     response.raise_for_status()
-                    
-                    # Get content length if available
                     total_size = int(response.headers.get('content-length', 0))
                     downloaded_size = 0
                     
-                    # Stream to temporary file
                     with open(temp_path, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=self.chunk_size):
                             if not self.is_running:
@@ -391,7 +576,6 @@ class StreamDownloader(QThread):
                                 f.write(chunk)
                                 downloaded_size += len(chunk)
                                 
-                                # Update progress if content length is known
                                 if total_size > 0:
                                     segment_progress = int((downloaded_size / total_size) * 100)
                                     with self.progress_lock:
@@ -401,13 +585,11 @@ class StreamDownloader(QThread):
                                             f"Downloading segment {index + 1}/{total}"
                                         )
 
-                # Verify downloaded file
                 if os.path.exists(temp_path):
                     file_size = os.path.getsize(temp_path)
                     if file_size < 100:
                         raise Exception(f"Segment {index} is too small: {file_size} bytes")
                     
-                    # Move temp file to final location
                     os.replace(temp_path, output_path)
                     
                     with self.download_lock:
@@ -425,11 +607,10 @@ class StreamDownloader(QThread):
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1}/{self.retry_count} failed for segment {index}: {str(e)}")
                 if attempt < self.retry_count - 1:
-                    time.sleep(0.5 * (attempt + 1))  # Reduced backoff time
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 return False
             finally:
-                # Cleanup temp file if it exists
                 if os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -439,12 +620,10 @@ class StreamDownloader(QThread):
         return False
 
     def combine_segments(self, segment_files, output_file):
-        """Combine downloaded segments into final video file with optimized processing."""
         try:
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
 
-            # Create concat file
             concat_file = os.path.join(self.temp_dir, 'concat.txt')
             with open(concat_file, 'w', encoding='utf-8') as f:
                 for segment in segment_files:
@@ -453,14 +632,16 @@ class StreamDownloader(QThread):
             output_format = self.settings.get('output_format', 'mp4')
             output_file = f"{output_file}.{output_format}"
 
-            # Optimized encoding parameters based on format
             encoding_params = {
                 'mp4': {
-                    'vcodec': 'copy',  # Try direct copy first
+                    'vcodec': 'copy',
                     'acodec': 'copy',
                     'extra': [
                         '-movflags', '+faststart',
-                        '-max_muxing_queue_size', '4096'
+                        '-max_muxing_queue_size', '4096',
+                        '-fflags', '+genpts',
+                        '-avoid_negative_ts', 'make_zero',
+                        '-async', '1'
                     ]
                 },
                 'mkv': {
@@ -468,7 +649,9 @@ class StreamDownloader(QThread):
                     'acodec': 'copy',
                     'extra': [
                         '-max_muxing_queue_size', '4096',
-                        '-map', '0'
+                        '-map', '0',
+                        '-fflags', '+genpts',
+                        '-async', '1'
                     ]
                 },
                 'ts': {
@@ -477,14 +660,15 @@ class StreamDownloader(QThread):
                     'extra': [
                         '-copyts',
                         '-muxdelay', '0',
-                        '-muxpreload', '0'
+                        '-muxpreload', '0',
+                        '-fflags', '+genpts',
+                        '-avoid_negative_ts', 'make_zero'
                     ]
                 }
             }
 
             params = encoding_params.get(output_format)
             
-            # Base FFmpeg command
             cmd = [
                 'ffmpeg', '-y',
                 '-hide_banner',
@@ -497,13 +681,9 @@ class StreamDownloader(QThread):
                 '-c:a', params['acodec']
             ]
             
-            # Add format-specific parameters
             cmd.extend(params['extra'])
-            
-            # Add output file
             cmd.append(output_file)
 
-            # Run FFmpeg with progress monitoring
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -532,7 +712,6 @@ class StreamDownloader(QThread):
             if process.returncode != 0:
                 raise Exception(f"FFmpeg error: {process.stderr.read().strip()}")
 
-            # Verify output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
                 raise Exception("Output file is missing or too small")
 
@@ -543,12 +722,10 @@ class StreamDownloader(QThread):
             return False
 
     def run(self):
-        """Main download process with enhanced error handling and progress reporting."""
         try:
             self.temp_dir = tempfile.mkdtemp()
             parsed_url = urlparse(self.url)
 
-            # Get playlist content
             if self.url.startswith('#EXTM3U'):
                 content = self.url
             else:
@@ -563,20 +740,18 @@ class StreamDownloader(QThread):
 
             playlist = m3u8.loads(content)
 
-            # Handle master playlist
             if not playlist.segments and playlist.playlists:
                 playlists = sorted(
                     playlist.playlists,
                     key=lambda p: p.stream_info.bandwidth if p.stream_info else 0
                 )
                 
-                # Select quality based on settings
                 quality = self.settings.get('quality', 'best')
                 if quality == 'best':
                     selected_playlist = playlists[-1]
                 elif quality == 'worst':
                     selected_playlist = playlists[0]
-                else:  # medium
+                else:
                     selected_playlist = playlists[len(playlists)//2]
 
                 playlist_url = selected_playlist.uri
@@ -600,14 +775,12 @@ class StreamDownloader(QThread):
             base_url = get_base_url(self.url, parsed_url)
             total_segments = len(playlist.segments)
 
-            # Prepare segment download tasks
             segment_tasks = []
             for i, segment in enumerate(playlist.segments):
                 output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
                 segment_url = urljoin(base_url, segment.uri)
                 segment_tasks.append((segment_url, output_path, i))
 
-            # Download segments concurrently
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_segments) as executor:
                 futures = {
                     executor.submit(
@@ -635,7 +808,6 @@ class StreamDownloader(QThread):
             if len(self.completed_segments) != total_segments:
                 raise Exception(f"Missing segments. Downloaded {len(self.completed_segments)}/{total_segments}")
 
-            # Process final video
             self.progress_updated.emit(self.url, 90, "Processing video...")
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -659,160 +831,27 @@ class StreamDownloader(QThread):
             logger.error(f"Download error: {str(e)}")
             self.download_error.emit(self.url, str(e))
         finally:
-            # Clean up temporary files
             if self.temp_dir and os.path.exists(self.temp_dir):
                 try:
                     shutil.rmtree(self.temp_dir, ignore_errors=True)
                 except:
                     pass
-            
-            # Clean up session
             try:
                 self.session.close()
             except:
                 pass
 
     def stop(self):
-        """Safely stop the download process."""
         self.is_running = False
         try:
             self.session.close()
         except:
             pass
 
-    def _get_system_memory_status(self):
-        """Get current system memory usage status."""
-        try:
-            memory = psutil.virtual_memory()
-            return {
-                'total': memory.total,
-                'available': memory.available,
-                'percent': memory.percent,
-                'used': memory.used,
-                'free': memory.free
-            }
-        except:
-            return None
-
-    def _adjust_workers_dynamically(self):
-        """Dynamically adjust worker count based on system load."""
-        try:
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory = self._get_system_memory_status()
-            
-            if memory and cpu_percent:
-                # Reduce workers if system is under heavy load
-                if cpu_percent > 85 or memory['percent'] > 90:
-                    self.max_concurrent_segments = max(4, self.max_concurrent_segments - 2)
-                # Increase workers if system has capacity
-                elif cpu_percent < 60 and memory['percent'] < 70:
-                    self.max_concurrent_segments = min(64, self.max_concurrent_segments + 2)
-        except:
-            pass
-
-    def _segment_cleanup(self, segment_path):
-        """Safely clean up a segment file."""
-        try:
-            if os.path.exists(segment_path):
-                os.remove(segment_path)
-        except Exception as e:
-            logger.error(f"Error cleaning up segment {segment_path}: {str(e)}")
-
-    def _verify_segment_integrity(self, segment_path):
-        """Verify the integrity of a downloaded segment."""
-        try:
-            if not os.path.exists(segment_path):
-                return False
-                
-            # Check file size
-            file_size = os.path.getsize(segment_path)
-            if file_size < 100:  # Too small to be valid
-                return False
-                
-            # Basic header check for TS format
-            with open(segment_path, 'rb') as f:
-                header = f.read(188)  # TS packet size
-                if len(header) == 188 and header[0] == 0x47:  # Valid TS sync byte
-                    return True
-                    
-            return False
-        except:
-            return False
-
-    def _optimize_chunk_size(self, content_length):
-        """Dynamically optimize chunk size based on content length."""
-        if not content_length:
-            return self.chunk_size
-            
-        # For very small files, use smaller chunks
-        if content_length < 1024 * 1024:  # < 1MB
-            return 16 * 1024  # 16KB chunks
-        # For very large files, use larger chunks
-        elif content_length > 100 * 1024 * 1024:  # > 100MB
-            return 4 * 1024 * 1024  # 4MB chunks
-            
-        return self.chunk_size
-
-    def _calculate_progress(self, downloaded, total_size, segment_index, total_segments):
-        """Calculate overall download progress."""
-        if total_size:
-            segment_progress = (downloaded / total_size) * 100
-        else:
-            segment_progress = 0
-            
-        overall_progress = (
-            (segment_index + (segment_progress / 100)) / total_segments * 90
-        )
-        return min(99, overall_progress)
-
-    def _handle_network_error(self, error, attempt, segment_index):
-        """Handle network-related errors with smart retry logic."""
-        error_str = str(error).lower()
-        
-        # Determine retry delay based on error type
-        if 'timeout' in error_str:
-            delay = 1 * (attempt + 1)  # Linear backoff for timeouts
-        elif 'connection' in error_str:
-            delay = 2 * (attempt + 1)  # Longer delay for connection issues
-        elif '503' in error_str:
-            delay = 5  # Fixed delay for service unavailable
-        else:
-            delay = 0.5 * (attempt + 1)  # Default exponential backoff
-            
-        logger.warning(f"Segment {segment_index} download failed (attempt {attempt + 1}): {error}")
-        return delay
-
-    def _check_disk_space(self, required_space):
-        """Check if there's enough disk space available."""
-        try:
-            if self.temp_dir:
-                disk_usage = psutil.disk_usage(self.temp_dir)
-                return disk_usage.free > required_space
-        except:
-            pass
-        return True  # Assume enough space if check fails
-
-    def _estimate_required_space(self, segment_count, avg_segment_size):
-        """Estimate required disk space for download."""
-        # Estimate space needed for segments
-        segment_space = segment_count * avg_segment_size
-        # Add 20% buffer for processing
-        total_space = segment_space * 1.2
-        return total_space
-
-    def get_download_stats(self):
-        """Get current download statistics."""
-        return {
-            'completed_segments': len(self.completed_segments),
-            'worker_count': self.max_concurrent_segments,
-            'chunk_size': self.chunk_size,
-            'is_running': self.is_running,
-            'memory_usage': self._get_system_memory_status()
-        }
-
 class SettingsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.plugin_manager = PluginManager()
         self.init_ui()
 
     def init_ui(self):
@@ -822,14 +861,12 @@ class SettingsTab(QWidget):
         video_group = QGroupBox("Video Settings")
         video_layout = QGridLayout()
         
-        # Quality selection
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(['best', 'medium', 'worst'])
         self.quality_combo.setToolTip("Select the video quality for multi-quality streams")
         video_layout.addWidget(QLabel("Quality:"), 0, 0)
         video_layout.addWidget(self.quality_combo, 0, 1)
         
-        # Format selection with tooltips
         self.format_combo = QComboBox()
         self.format_combo.addItems(['mp4', 'mkv', 'ts'])
         self.format_combo.setItemData(0, "Best for compatibility and streaming (recommended)", Qt.ToolTipRole)
@@ -838,7 +875,6 @@ class SettingsTab(QWidget):
         video_layout.addWidget(QLabel("Output Format:"), 1, 0)
         video_layout.addWidget(self.format_combo, 1, 1)
         
-        # Quality presets
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(['Standard', 'High Quality', 'Small Size'])
         self.preset_combo.setToolTip("Predefined quality settings for different use cases")
@@ -882,6 +918,35 @@ class SettingsTab(QWidget):
         download_group.setLayout(download_layout)
         layout.addWidget(download_group)
 
+        # Plugin Management
+        plugin_group = QGroupBox("Plugin Management")
+        plugin_layout = QVBoxLayout()
+        
+        # Plugin list
+        self.plugin_list = QScrollArea()
+        self.plugin_list.setWidgetResizable(True)
+        self.plugin_list_widget = QWidget()
+        self.plugin_list_layout = QVBoxLayout(self.plugin_list_widget)
+        self.plugin_list.setWidget(self.plugin_list_widget)
+        
+        # Plugin controls
+        plugin_buttons = QHBoxLayout()
+        
+        install_btn = QPushButton("Install Plugin")
+        install_btn.clicked.connect(self.install_plugin)
+        plugin_buttons.addWidget(install_btn)
+        
+        refresh_btn = QPushButton("Refresh Plugins")
+        refresh_btn.clicked.connect(self.refresh_plugins)
+        plugin_buttons.addWidget(refresh_btn)
+        
+        plugin_layout.addLayout(plugin_buttons)
+        plugin_layout.addWidget(self.plugin_list)
+        plugin_group.setLayout(plugin_layout)
+        layout.addWidget(plugin_group)
+        
+        self.refresh_plugins()
+        
         # Output Settings
         output_group = QGroupBox("Output Settings")
         output_layout = QGridLayout()
@@ -903,7 +968,6 @@ class SettingsTab(QWidget):
         layout.addStretch()
 
     def apply_preset(self, preset):
-        """Apply predefined quality settings."""
         if preset == 'High Quality':
             self.quality_combo.setCurrentText('best')
             self.format_combo.setCurrentText('mkv')
@@ -916,6 +980,98 @@ class SettingsTab(QWidget):
             self.quality_combo.setCurrentText('best')
             self.format_combo.setCurrentText('mp4')
             self.preserve_source_check.setChecked(True)
+
+    def install_plugin(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Plugin File",
+            "",
+            "M3U8ME Plugins (*.m3uplug)"
+        )
+        
+        if file_path:
+            success, message = self.plugin_manager.install_plugin(file_path)
+            
+            if success:
+                self.refresh_plugins()
+                reply = QMessageBox.question(
+                    self,
+                    "Plugin Installed",
+                    "Plugin installed successfully. Restart application to apply changes?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    QApplication.quit()
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Installation Failed",
+                    message,
+                    QMessageBox.Ok
+                )
+
+    def refresh_plugins(self):
+        for i in reversed(range(self.plugin_list_layout.count())):
+            self.plugin_list_layout.itemAt(i).widget().deleteLater()
+        
+        plugins = self.plugin_manager.get_installed_plugins()
+        for name, info in plugins.items():
+            plugin_widget = QFrame()
+            plugin_widget.setFrameStyle(QFrame.Box | QFrame.Raised)
+            plugin_layout = QHBoxLayout(plugin_widget)
+            
+            # Plugin info
+            info_layout = QVBoxLayout()
+            name_label = QLabel(f"<b>{info.get('name', name)}</b>")
+            desc_label = QLabel(info.get('description', 'No description'))
+            version_label = QLabel(f"Version: {info.get('version', '1.0')}")
+            
+            info_layout.addWidget(name_label)
+            info_layout.addWidget(desc_label)
+            info_layout.addWidget(version_label)
+            
+            # Uninstall button
+            uninstall_btn = QPushButton("Uninstall")
+            uninstall_btn.clicked.connect(
+                lambda n=name: self.uninstall_plugin(n)
+            )
+            
+            plugin_layout.addLayout(info_layout)
+            plugin_layout.addWidget(uninstall_btn)
+            
+            self.plugin_list_layout.addWidget(plugin_widget)
+        
+        self.plugin_list_layout.addStretch()
+
+    def uninstall_plugin(self, plugin_name):
+        reply = QMessageBox.question(
+            self,
+            "Confirm Uninstall",
+            f"Are you sure you want to uninstall {plugin_name}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            success, message = self.plugin_manager.uninstall_plugin(plugin_name)
+            
+            if success:
+                self.refresh_plugins()
+                QMessageBox.information(
+                    self,
+                    "Plugin Uninstalled",
+                    "Plugin uninstalled successfully. Please restart the application.",
+                    QMessageBox.Ok
+                )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Uninstall Failed",
+                    message,
+                    QMessageBox.Ok
+                )
 
     def get_settings(self):
         return {
@@ -956,183 +1112,36 @@ class SettingsTab(QWidget):
 class M3U8StreamDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
+        # First initialize all instance variables
+        self.force_quit = False
         self.setWindowTitle("M3U8 Stream Downloader")
         self.setMinimumSize(900, 700)
         self.active_downloads = {}
         self.save_path = None
-        self.init_ui()
-        self.load_settings()
-        self.check_ffmpeg()
-
-    def check_ffmpeg(self):
-        """Verify FFmpeg installation and capabilities."""
-        if not shutil.which('ffmpeg'):
-            QMessageBox.critical(
-                self,
-                "FFmpeg Not Found",
-                "FFmpeg is required but not found on your system. Please install FFmpeg and make sure it's in your system PATH.",
-                QMessageBox.Ok
-            )
-            sys.exit(1)
-        
-        try:
-            # Check FFmpeg version and capabilities
-            result = subprocess.run(
-                ['ffmpeg', '-version'],
-                capture_output=True,
-                text=True
-            )
-            if 'ffmpeg version' not in result.stdout:
-                raise Exception("Invalid FFmpeg installation")
-                
-            # Get first line of version info without using backslash
-            version_line = result.stdout.split('\n')[0]
-            logger.info(f"FFmpeg found: {version_line}")
-        except Exception as e:
-            QMessageBox.warning(
-                self,
-                "FFmpeg Check Failed",
-                f"Error verifying FFmpeg installation: {str(e)}\nSome features may not work correctly.",
-                QMessageBox.Ok
-            )
-
-    def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
-    
-        # Add logo only
-        logo_container = QWidget()
-        logo_container.setFixedHeight(100)  # Adjust height as needed
-        logo_layout = QHBoxLayout(logo_container)
-        
-        # Create and configure logo label
-        logo_label = QLabel()
-        logo_pixmap = QPixmap("logo.png")
-        # Scale the logo while maintaining aspect ratio
-        scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        logo_label.setPixmap(scaled_pixmap)
-        logo_label.setAlignment(Qt.AlignCenter)
-        
-        # Center the logo
-        logo_layout.addStretch()
-        logo_layout.addWidget(logo_label)
-        logo_layout.addStretch()
-        
-        layout.addWidget(logo_container)
-    
-        # Main content
-        self.tab_widget = QTabWidget()
+        self.url_input = None
+        self.downloads_area = None
+        self.downloads_widget = None
+        self.downloads_layout = None
+        self.start_all_btn = None
+        self.stop_all_btn = None
+        self.clear_completed_btn = None
+        self.tab_widget = None
         self.download_tab = QWidget()
         self.settings_tab = SettingsTab()
         
-        self.tab_widget.addTab(self.download_tab, "Downloads")
-        self.tab_widget.addTab(self.settings_tab, "Settings")
-        
-        layout.addWidget(self.tab_widget)
-    
-        self.init_download_tab()
+        # Then create the UI
+        self.init_ui()
         self.setup_status_bar()
+        self.tray_icon = SystemTrayApp(self)
+        
+        # Finally, do system checks and load settings
+        self.check_first_run()
+        self.process_arguments()
+        self.load_settings()
+        self.check_ffmpeg()
 
-    def init_download_tab(self):
-        layout = QVBoxLayout(self.download_tab)
-
-        # URL input area
-        url_group = QGroupBox("Add Stream")
-        url_layout = QHBoxLayout()
-        
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Enter M3U8 stream URL or paste M3U8 content")
-        self.url_input.returnPressed.connect(self.add_url_from_input)
-        url_layout.addWidget(self.url_input)
-
-        # Add URL button with icon and tooltip
-        self.add_url_btn = QPushButton("Add URL")
-        self.add_url_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
-        self.add_url_btn.setToolTip("Add a single URL to the download queue")
-        self.add_url_btn.clicked.connect(self.add_url_from_input)
-        url_layout.addWidget(self.add_url_btn)
-
-        # Bulk upload button with icon and tooltip
-        self.bulk_upload_btn = QPushButton("Bulk Upload")
-        self.bulk_upload_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
-        self.bulk_upload_btn.setToolTip("Upload multiple URLs from a file")
-        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
-        url_layout.addWidget(self.bulk_upload_btn)
-        
-        url_group.setLayout(url_layout)
-        layout.addWidget(url_group)
-
-        # Downloads area with improved scrolling
-        downloads_group = QGroupBox("Downloads")
-        downloads_layout = QVBoxLayout()
-        
-        self.downloads_area = QScrollArea()
-        self.downloads_area.setWidgetResizable(True)
-        self.downloads_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.downloads_widget = QWidget()
-        self.downloads_layout = QVBoxLayout(self.downloads_widget)
-        self.downloads_layout.addStretch()
-        self.downloads_area.setWidget(self.downloads_widget)
-        downloads_layout.addWidget(self.downloads_area)
-        
-        downloads_group.setLayout(downloads_layout)
-        layout.addWidget(downloads_group)
-
-        # Control buttons with icons and tooltips
-        control_group = QGroupBox()
-        button_layout = QHBoxLayout()
-        
-        self.start_all_btn = QPushButton("Start All")
-        self.start_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.start_all_btn.setToolTip("Start all pending downloads")
-        self.start_all_btn.clicked.connect(self.start_all_downloads)
-        self.start_all_btn.setEnabled(False)
-        button_layout.addWidget(self.start_all_btn)
-        
-        self.stop_all_btn = QPushButton("Stop All")
-        self.stop_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_all_btn.setToolTip("Stop all active downloads")
-        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
-        self.stop_all_btn.setEnabled(False)
-        button_layout.addWidget(self.stop_all_btn)
-        
-        self.clear_completed_btn = QPushButton("Clear Completed")
-        self.clear_completed_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
-        self.clear_completed_btn.setToolTip("Remove completed downloads from the list")
-        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
-        button_layout.addWidget(self.clear_completed_btn)
-        
-        control_group.setLayout(button_layout)
-        layout.addWidget(control_group)
-
-    def setup_status_bar(self):
-        """Set up an enhanced status bar with more information."""
-        self.statusBar().showMessage("Ready")
-        
-        # Create status widgets with tooltips
-        self.status_downloads = QLabel("Downloads: 0")
-        self.status_downloads.setToolTip("Total number of downloads")
-        
-        self.status_active = QLabel("Active: 0")
-        self.status_active.setToolTip("Currently downloading")
-        
-        self.status_completed = QLabel("Completed: 0")
-        self.status_completed.setToolTip("Successfully completed downloads")
-        
-        # Add a separator between status elements
-        separator = QLabel(" | ")
-        separator.setStyleSheet("color: #666666;")
-        
-        # Add widgets to status bar
-        self.statusBar().addPermanentWidget(self.status_downloads)
-        self.statusBar().addPermanentWidget(separator)
-        self.statusBar().addPermanentWidget(self.status_active)
-        self.statusBar().addPermanentWidget(QLabel(" | "))
-        self.statusBar().addPermanentWidget(self.status_completed)
-
+    # Signal-connected methods defined first
     def add_url_from_input(self):
-        """Add URL from input field with validation."""
         url = self.url_input.text().strip()
         if not url:
             return
@@ -1150,65 +1159,7 @@ class M3U8StreamDownloader(QMainWindow):
         self.url_input.clear()
         self.url_input.setFocus()
 
-    def add_download(self, url):
-        """Add a new download with duplicate checking."""
-        if url in self.active_downloads:
-            QMessageBox.warning(
-                self,
-                "Duplicate URL",
-                "This URL is already in the download queue!",
-                QMessageBox.Ok
-            )
-            return
-
-        download_widget = DownloadWidget(url)
-        download_widget.cancel_btn.clicked.connect(lambda: self.remove_download(url))
-        
-        self.downloads_layout.insertWidget(
-            self.downloads_layout.count() - 1,
-            download_widget
-        )
-        
-        self.active_downloads[url] = {
-            'widget': download_widget,
-            'worker': None,
-            'status': 'waiting'
-        }
-
-        self.start_all_btn.setEnabled(True)
-        self.update_status_bar()
-
-    def remove_download(self, url):
-        """Remove a download with confirmation if active."""
-        if url not in self.active_downloads:
-            return
-            
-        download = self.active_downloads[url]
-        if download['status'] == 'downloading':
-            reply = QMessageBox.question(
-                self,
-                "Confirm Cancel",
-                "This download is still in progress. Are you sure you want to cancel it?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
-
-        if download['worker']:
-            download['worker'].stop()
-            
-        download['widget'].deleteLater()
-        del self.active_downloads[url]
-
-        if not self.active_downloads:
-            self.start_all_btn.setEnabled(False)
-            self.stop_all_btn.setEnabled(False)
-            
-        self.update_status_bar()
-
     def bulk_upload(self):
-        """Enhanced bulk upload with better file handling."""
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select M3U8 Files or URL List",
@@ -1219,7 +1170,6 @@ class M3U8StreamDownloader(QMainWindow):
         if not file_paths:
             return
             
-        # Get save directory once for all files
         if not self.save_path:
             self.save_path = QFileDialog.getExistingDirectory(
                 self,
@@ -1230,7 +1180,6 @@ class M3U8StreamDownloader(QMainWindow):
             if not self.save_path:
                 return
 
-        # Track statistics for user feedback
         added = 0
         skipped = 0
         errors = 0
@@ -1238,7 +1187,6 @@ class M3U8StreamDownloader(QMainWindow):
         for file_path in file_paths:
             try:
                 if file_path.endswith('.txt'):
-                    # Handle text files with URLs
                     with open(file_path, 'r', encoding='utf-8') as f:
                         for line in f:
                             url = line.strip()
@@ -1249,7 +1197,6 @@ class M3U8StreamDownloader(QMainWindow):
                                 else:
                                     skipped += 1
                 else:
-                    # Handle M3U8 files
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read().strip()
                         if content not in self.active_downloads:
@@ -1262,7 +1209,6 @@ class M3U8StreamDownloader(QMainWindow):
                 logger.error(f"Error reading file {file_path}: {str(e)}")
                 errors += 1
 
-        # Show summary message
         message = f"Added {added} new downloads\n"
         if skipped > 0:
             message += f"Skipped {skipped} duplicate URLs\n"
@@ -1280,55 +1226,10 @@ class M3U8StreamDownloader(QMainWindow):
             self.start_all_btn.setEnabled(True)
             self.update_status_bar()
 
-    def start_download(self, url):
-        """Start a single download with improved error handling."""
-        if url not in self.active_downloads:
-            return
-
-        # Use existing save path or ask for one
-        save_path = self.save_path
-        if not save_path:
-            save_path = QFileDialog.getExistingDirectory(
-                self,
-                "Select Save Directory",
-                options=QFileDialog.ShowDirsOnly
-            )
-            
-            if not save_path:
-                return
-            
-            self.save_path = save_path
-
-        settings = self.settings_tab.get_settings()
-        
-        # Create and configure worker
-        worker = StreamDownloader(url, save_path, settings)
-        worker.progress_updated.connect(self.update_progress)
-        worker.download_complete.connect(self.download_finished)
-        worker.download_error.connect(self.download_error)
-        
-        # Update download status
-        self.active_downloads[url].update({
-            'worker': worker,
-            'status': 'downloading'
-        })
-        
-        self.active_downloads[url]['widget'].update_status(
-            "Initializing download...",
-            "#2979ff"
-        )
-        
-        # Start the download
-        worker.start()
-        self.stop_all_btn.setEnabled(True)
-        self.update_status_bar()
-
     def start_all_downloads(self):
-        """Start all pending downloads with concurrent option."""
         if not self.active_downloads:
             return
 
-        # Get save directory if not already set
         if not self.save_path:
             self.save_path = QFileDialog.getExistingDirectory(
                 self,
@@ -1345,23 +1246,13 @@ class M3U8StreamDownloader(QMainWindow):
         self.stop_all_btn.setEnabled(True)
 
         if concurrent:
-            # Start all pending downloads simultaneously
             for url in list(self.active_downloads.keys()):
                 if self.active_downloads[url]['status'] == 'waiting':
                     self.start_download(url)
         else:
-            # Start only the first pending download
             self.start_next_download()
 
-    def start_next_download(self):
-        """Start the next pending download in the queue."""
-        for url in self.active_downloads:
-            if self.active_downloads[url]['status'] == 'waiting':
-                self.start_download(url)
-                break
-
     def stop_all_downloads(self):
-        """Stop all active downloads with status updates."""
         active_count = 0
         for download in self.active_downloads.values():
             if download['status'] == 'downloading':
@@ -1384,7 +1275,6 @@ class M3U8StreamDownloader(QMainWindow):
         self.update_status_bar()
 
     def clear_completed_downloads(self):
-        """Clear completed downloads with confirmation."""
         completed_count = sum(1 for d in self.active_downloads.values() 
                             if d['status'] in ['completed', 'error', 'stopped'])
         
@@ -1415,8 +1305,241 @@ class M3U8StreamDownloader(QMainWindow):
                 QMessageBox.Ok
             )
 
+    def create_buttons(self):
+        """Create control buttons and connect signals"""
+        # Add URL button
+        self.add_url_btn = QPushButton("Add URL")
+        self.add_url_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        self.add_url_btn.setToolTip("Add a single URL to the download queue")
+        self.add_url_btn.clicked.connect(self.add_url_from_input)
+
+        # Bulk upload button
+        self.bulk_upload_btn = QPushButton("Bulk Upload")
+        self.bulk_upload_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        self.bulk_upload_btn.setToolTip("Upload multiple URLs from a file")
+        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
+
+        # Control buttons
+        self.start_all_btn = QPushButton("Start All")
+        self.start_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_all_btn.setToolTip("Start all pending downloads")
+        self.start_all_btn.clicked.connect(self.start_all_downloads)
+        self.start_all_btn.setEnabled(False)
+
+        self.stop_all_btn = QPushButton("Stop All")
+        self.stop_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_all_btn.setToolTip("Stop all active downloads")
+        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
+        self.stop_all_btn.setEnabled(False)
+
+        self.clear_completed_btn = QPushButton("Clear Completed")
+        self.clear_completed_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        self.clear_completed_btn.setToolTip("Remove completed downloads from the list")
+        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+    
+        # Logo
+        logo_container = QWidget()
+        logo_container.setFixedHeight(100)
+        logo_layout = QHBoxLayout(logo_container)
+        
+        logo_label = QLabel()
+        try:
+            logo_pixmap = QPixmap("logo.png")
+            scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
+        except:
+            logo_label.setText("M3U8ME")
+            logo_label.setStyleSheet("font-size: 24pt; font-weight: bold;")
+            
+        logo_label.setAlignment(Qt.AlignCenter)
+        
+        logo_layout.addStretch()
+        logo_layout.addWidget(logo_label)
+        logo_layout.addStretch()
+        
+        layout.addWidget(logo_container)
+    
+        # Create control buttons before initializing tabs
+        self.create_buttons()
+        
+        # Main content
+        self.tab_widget = QTabWidget()
+        self.init_download_tab()
+        
+        self.tab_widget.addTab(self.download_tab, "Downloads")
+        self.tab_widget.addTab(self.settings_tab, "Settings")
+        
+        layout.addWidget(self.tab_widget)
+        
+    def init_download_tab(self):
+        layout = QVBoxLayout(self.download_tab)
+
+        # URL input area
+        url_group = QGroupBox("Add Stream")
+        url_layout = QHBoxLayout()
+        
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Enter M3U8 stream URL or paste M3U8 content")
+        self.url_input.returnPressed.connect(self.add_url_from_input)
+        url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.add_url_btn)
+        url_layout.addWidget(self.bulk_upload_btn)
+        
+        url_group.setLayout(url_layout)
+        layout.addWidget(url_group)
+
+        # Downloads area
+        downloads_group = QGroupBox("Downloads")
+        downloads_layout = QVBoxLayout()
+        
+        self.downloads_area = QScrollArea()
+        self.downloads_area.setWidgetResizable(True)
+        self.downloads_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.downloads_widget = QWidget()
+        self.downloads_layout = QVBoxLayout(self.downloads_widget)
+        self.downloads_layout.addStretch()
+        self.downloads_area.setWidget(self.downloads_widget)
+        downloads_layout.addWidget(self.downloads_area)
+        
+        downloads_group.setLayout(downloads_layout)
+        layout.addWidget(downloads_group)
+
+        # Control buttons
+        control_group = QGroupBox()
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.start_all_btn)
+        button_layout.addWidget(self.stop_all_btn)
+        button_layout.addWidget(self.clear_completed_btn)
+        
+        control_group.setLayout(button_layout)
+        layout.addWidget(control_group)
+
+    def setup_status_bar(self):
+        self.statusBar().showMessage("Ready")
+        
+        self.status_downloads = QLabel("Downloads: 0")
+        self.status_downloads.setToolTip("Total number of downloads")
+        
+        self.status_active = QLabel("Active: 0")
+        self.status_active.setToolTip("Currently downloading")
+        
+        self.status_completed = QLabel("Completed: 0")
+        self.status_completed.setToolTip("Successfully completed downloads")
+        
+        separator = QLabel(" | ")
+        separator.setStyleSheet("color: #666666;")
+        
+        self.statusBar().addPermanentWidget(self.status_downloads)
+        self.statusBar().addPermanentWidget(separator)
+        self.statusBar().addPermanentWidget(self.status_active)
+        self.statusBar().addPermanentWidget(QLabel(" | "))
+        self.statusBar().addPermanentWidget(self.status_completed)
+
+    def add_download(self, url):
+        if url in self.active_downloads:
+            QMessageBox.warning(
+                self,
+                "Duplicate URL",
+                "This URL is already in the download queue!",
+                QMessageBox.Ok
+            )
+            return
+
+        download_widget = DownloadWidget(url)
+        download_widget.cancel_btn.clicked.connect(lambda: self.remove_download(url))
+        
+        self.downloads_layout.insertWidget(
+            self.downloads_layout.count() - 1,
+            download_widget
+        )
+        
+        self.active_downloads[url] = {
+            'widget': download_widget,
+            'worker': None,
+            'status': 'waiting'
+        }
+
+        self.start_all_btn.setEnabled(True)
+        self.update_status_bar()
+
+    def remove_download(self, url):
+        if url not in self.active_downloads:
+            return
+            
+        download = self.active_downloads[url]
+        if download['status'] == 'downloading':
+            reply = QMessageBox.question(
+                self,
+                "Confirm Cancel",
+                "This download is still in progress. Are you sure you want to cancel it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        if download['worker']:
+            download['worker'].stop()
+            
+        download['widget'].deleteLater()
+        del self.active_downloads[url]
+
+        if not self.active_downloads:
+            self.start_all_btn.setEnabled(False)
+            self.stop_all_btn.setEnabled(False)
+            
+        self.update_status_bar()
+
+    def start_download(self, url):
+        if url not in self.active_downloads:
+            return
+
+        save_path = self.save_path
+        if not save_path:
+            save_path = QFileDialog.getExistingDirectory(
+                self,
+                "Select Save Directory",
+                options=QFileDialog.ShowDirsOnly
+            )
+            
+            if not save_path:
+                return
+            
+            self.save_path = save_path
+
+        settings = self.settings_tab.get_settings()
+        
+        worker = StreamDownloader(url, save_path, settings)
+        worker.progress_updated.connect(self.update_progress)
+        worker.download_complete.connect(self.download_finished)
+        worker.download_error.connect(self.download_error)
+        
+        self.active_downloads[url].update({
+            'worker': worker,
+            'status': 'downloading'
+        })
+        
+        self.active_downloads[url]['widget'].update_status(
+            "Initializing download...",
+            "#2979ff"
+        )
+        
+        worker.start()
+        self.stop_all_btn.setEnabled(True)
+        self.update_status_bar()
+
+    def start_next_download(self):
+        for url in self.active_downloads:
+            if self.active_downloads[url]['status'] == 'waiting':
+                self.start_download(url)
+                break
+
     def update_progress(self, url, progress, status):
-        """Update download progress with enhanced visual feedback."""
         if url not in self.active_downloads:
             return
 
@@ -1424,13 +1547,12 @@ class M3U8StreamDownloader(QMainWindow):
         download['widget'].progress_bar.setValue(progress)
         download['widget'].update_status(status)
         
-        # Update progress bar color based on progress
         if progress < 30:
-            color = "#ff5252"  # Red
+            color = "#ff5252"
         elif progress < 70:
-            color = "#ffd740"  # Yellow
+            color = "#ffd740"
         else:
-            color = "#69f0ae"  # Green
+            color = "#69f0ae"
             
         download['widget'].progress_bar.setStyleSheet(
             f"""
@@ -1444,7 +1566,6 @@ class M3U8StreamDownloader(QMainWindow):
         self.update_status_bar()
 
     def download_finished(self, url):
-        """Handle successful download completion."""
         if url not in self.active_downloads:
             return
 
@@ -1465,7 +1586,6 @@ class M3U8StreamDownloader(QMainWindow):
         if not settings['concurrent_downloads']:
             self.start_next_download()
 
-        # Check if all downloads are complete
         active_downloads = any(
             download['status'] == 'downloading' 
             for download in self.active_downloads.values()
@@ -1491,7 +1611,6 @@ class M3U8StreamDownloader(QMainWindow):
         self.update_status_bar()
 
     def download_error(self, url, error):
-        """Handle download errors with detailed feedback."""
         if url not in self.active_downloads:
             return
 
@@ -1516,7 +1635,6 @@ class M3U8StreamDownloader(QMainWindow):
         self.update_status_bar()
 
     def update_status_bar(self):
-        """Update status bar with detailed download statistics."""
         total = len(self.active_downloads)
         active = sum(1 for d in self.active_downloads.values() if d['status'] == 'downloading')
         completed = sum(1 for d in self.active_downloads.values() if d['status'] == 'completed')
@@ -1535,41 +1653,116 @@ class M3U8StreamDownloader(QMainWindow):
         else:
             self.statusBar().showMessage("Ready")
 
+    def check_first_run(self):
+        settings = QSettings('M3U8ME', 'M3U8StreamDownloader')
+        if not settings.value('first_run_complete', False, type=bool):
+            reply = QMessageBox.question(
+                self,
+                "First Run Setup",
+                "Would you like to set M3U8ME as the default application for .m3u8 files?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                if FileAssociationHandler.setup_file_associations():
+                    QMessageBox.information(
+                        self,
+                        "Setup Complete",
+                        "M3U8ME has been set as the default application for .m3u8 files.",
+                        QMessageBox.Ok
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Setup Failed",
+                        "Failed to set up file associations. Try running the application as administrator.",
+                        QMessageBox.Ok
+                    )
+            
+            settings.setValue('first_run_complete', True)
+
+    def process_arguments(self):
+        args = sys.argv[1:]
+        for arg in args:
+            if arg.startswith('m3u8me:'):
+                url = arg.replace('m3u8me:', '')
+                self.add_download(url)
+            elif arg.lower().endswith('.m3u8'):
+                try:
+                    with open(arg, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    self.add_download(content)
+                except Exception as e:
+                    logger.error(f"Failed to open file: {str(e)}")
+                    QMessageBox.warning(
+                        self,
+                        "Error",
+                        f"Failed to open file: {str(e)}",
+                        QMessageBox.Ok
+                    )
+
+    def check_ffmpeg(self):
+        if not shutil.which('ffmpeg'):
+            QMessageBox.critical(
+                self,
+                "FFmpeg Not Found",
+                "FFmpeg is required but not found on your system. Please install FFmpeg and make sure it's in your system PATH.",
+                QMessageBox.Ok
+            )
+            sys.exit(1)
+        
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-version'],
+                capture_output=True,
+                text=True
+            )
+            if 'ffmpeg version' not in result.stdout:
+                raise Exception("Invalid FFmpeg installation")
+                
+            version_line = result.stdout.split('\n')[0]
+            logger.info(f"FFmpeg found: {version_line}")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "FFmpeg Check Failed",
+                f"Error verifying FFmpeg installation: {str(e)}\nSome features may not work correctly.",
+                QMessageBox.Ok
+            )
+
     def load_settings(self):
-        """Load application settings."""
         self.settings_tab.load_settings()
 
     def save_settings(self):
-        """Save application settings."""
         self.settings_tab.save_settings()
 
     def closeEvent(self, event):
-        """Handle application closure with active download check."""
-        active_downloads = any(
-            download['status'] == 'downloading' 
-            for download in self.active_downloads.values()
-        )
-        
-        if active_downloads:
-            reply = QMessageBox.question(
-                self,
-                "Confirm Exit",
-                "There are active downloads. Are you sure you want to exit?\nActive downloads will be cancelled.",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
+        if self.force_quit:
+            self.save_settings()
+            self.stop_all_downloads()
+            event.accept()
+        else:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "M3U8ME",
+                "Application minimized to tray. Double-click the tray icon to restore.",
+                QSystemTrayIcon.Information,
+                2000
             )
-            
-            if reply == QMessageBox.No:
-                event.ignore()
-                return
-        
-        self.save_settings()
-        self.stop_all_downloads()
-        super().closeEvent(event)
+
+def handle_new_instance(server, window):
+    socket = server.nextPendingConnection()
+    if socket.waitForReadyRead(1000):
+        data = socket.readAll().data().decode()
+        if data:
+            args = data.split()
+            window.process_arguments(args)
+        window.show()
+        window.activateWindow()
 
 def main():
-    """Main application entry point with enhanced error handling."""
-    # Enable high DPI support
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
@@ -1577,9 +1770,24 @@ def main():
     
     app = QApplication(sys.argv)
     
+    socket = QLocalSocket()
+    socket.connectToServer('M3U8ME-SingleInstance')
+    
+    if socket.waitForConnected(500):
+        socket.write(' '.join(sys.argv[1:]).encode())
+        socket.waitForBytesWritten()
+        sys.exit(0)
+    else:
+        server = QLocalServer()
+        server.listen('M3U8ME-SingleInstance')
+        
     try:
         CustomStyle.apply_dark_theme(app)
         window = M3U8StreamDownloader()
+        
+        if server:
+            server.newConnection.connect(lambda: handle_new_instance(server, window))
+            
         window.show()
         sys.exit(app.exec_())
     except Exception as e:
