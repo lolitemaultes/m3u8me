@@ -623,23 +623,24 @@ class StreamDownloader(QThread):
         try:
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
-
+    
             concat_file = os.path.join(self.temp_dir, 'concat.txt')
             with open(concat_file, 'w', encoding='utf-8') as f:
                 for segment in segment_files:
                     f.write(f"file '{segment}'\n")
-
+    
             output_format = self.settings.get('output_format', 'mp4')
             output_file = f"{output_file}.{output_format}"
-
+    
+            # Simplified encoding parameters focused on speed and stability
             encoding_params = {
                 'mp4': {
-                    'vcodec': 'copy',
+                    'vcodec': 'copy',  # Use copy by default for speed
                     'acodec': 'copy',
                     'extra': [
                         '-movflags', '+faststart',
-                        '-max_muxing_queue_size', '4096',
-                        '-fflags', '+genpts',
+                        '-max_muxing_queue_size', '9999',
+                        '-fflags', '+genpts+igndts',
                         '-avoid_negative_ts', 'make_zero',
                         '-async', '1'
                     ]
@@ -648,9 +649,8 @@ class StreamDownloader(QThread):
                     'vcodec': 'copy',
                     'acodec': 'copy',
                     'extra': [
-                        '-max_muxing_queue_size', '4096',
-                        '-map', '0',
-                        '-fflags', '+genpts',
+                        '-max_muxing_queue_size', '9999',
+                        '-fflags', '+genpts+igndts',
                         '-async', '1'
                     ]
                 },
@@ -660,13 +660,20 @@ class StreamDownloader(QThread):
                     'extra': [
                         '-copyts',
                         '-muxdelay', '0',
-                        '-muxpreload', '0',
-                        '-fflags', '+genpts',
-                        '-avoid_negative_ts', 'make_zero'
+                        '-muxpreload', '0'
                     ]
                 }
             }
-
+    
+            # Only use encoding if explicitly requested and format supports it
+            if self.settings.get('preserve_source', True) and output_format in ['mp4', 'mkv']:
+                encoding_params[output_format]['vcodec'] = 'libx264'
+                encoding_params[output_format]['extra'].extend([
+                    '-preset', 'ultrafast',  # Much faster encoding
+                    '-crf', '23',  # Good balance of quality and speed
+                    '-tune', 'fastdecode'  # Optimize for playback
+                ])
+    
             params = encoding_params.get(output_format)
             
             cmd = [
@@ -683,18 +690,26 @@ class StreamDownloader(QThread):
             
             cmd.extend(params['extra'])
             cmd.append(output_file)
-
+    
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True
             )
+    
+            # Add timeout for the processing
+            start_time = time.time()
+            timeout = 300  # 5 minutes timeout
             
             while True:
                 if not self.is_running:
                     process.terminate()
                     raise Exception("Processing cancelled by user")
+                    
+                if time.time() - start_time > timeout:
+                    process.terminate()
+                    raise Exception("Processing timed out after 5 minutes")
                     
                 output = process.stderr.readline()
                 if output == '' and process.poll() is not None:
@@ -704,19 +719,19 @@ class StreamDownloader(QThread):
                     try:
                         time_str = output.split('time=')[1].split()[0]
                         h, m, s = map(float, time_str.split(':'))
-                        progress = min(99, 90 + int(h * 3600 + m * 60 + s) % 10)
+                        progress = min(99, 90 + int((h * 3600 + m * 60 + s) / 2))
                         self.progress_updated.emit(self.url, progress, "Processing video...")
                     except:
                         pass
-
+    
             if process.returncode != 0:
                 raise Exception(f"FFmpeg error: {process.stderr.read().strip()}")
-
+    
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
                 raise Exception("Output file is missing or too small")
-
+    
             return True
-
+    
         except Exception as e:
             logger.error(f"Error combining segments: {str(e)}")
             return False
@@ -852,7 +867,10 @@ class SettingsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plugin_manager = PluginManager()
+        self.original_settings = {}
         self.init_ui()
+        self.load_settings()  # Load initial settings
+        self.save_original_settings()  # Save initial state
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -925,6 +943,7 @@ class SettingsTab(QWidget):
         # Plugin list
         self.plugin_list = QScrollArea()
         self.plugin_list.setWidgetResizable(True)
+        self.plugin_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.plugin_list_widget = QWidget()
         self.plugin_list_layout = QVBoxLayout(self.plugin_list_widget)
         self.plugin_list.setWidget(self.plugin_list_widget)
@@ -964,6 +983,26 @@ class SettingsTab(QWidget):
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
         
+        # Apply Button
+        button_layout = QHBoxLayout()
+        self.apply_btn = QPushButton("Apply Changes")
+        self.apply_btn.clicked.connect(self.apply_settings)
+        self.apply_btn.setEnabled(False)  # Initially disabled
+        button_layout.addStretch()
+        button_layout.addWidget(self.apply_btn)
+        layout.addLayout(button_layout)
+        
+        # Connect all settings controls to update checker
+        self.quality_combo.currentTextChanged.connect(self.check_settings_changed)
+        self.format_combo.currentTextChanged.connect(self.check_settings_changed)
+        self.thread_spin.valueChanged.connect(self.check_settings_changed)
+        self.timeout_spin.valueChanged.connect(self.check_settings_changed)
+        self.retry_spin.valueChanged.connect(self.check_settings_changed)
+        self.concurrent_check.stateChanged.connect(self.check_settings_changed)
+        self.auto_rename_check.stateChanged.connect(self.check_settings_changed)
+        self.preserve_source_check.stateChanged.connect(self.check_settings_changed)
+        self.preset_combo.currentTextChanged.connect(self.check_settings_changed)
+
         # Add a spacer at the bottom
         layout.addStretch()
 
@@ -1014,7 +1053,9 @@ class SettingsTab(QWidget):
 
     def refresh_plugins(self):
         for i in reversed(range(self.plugin_list_layout.count())):
-            self.plugin_list_layout.itemAt(i).widget().deleteLater()
+            widget = self.plugin_list_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
         
         plugins = self.plugin_manager.get_installed_plugins()
         for name, info in plugins.items():
@@ -1073,6 +1114,27 @@ class SettingsTab(QWidget):
                     QMessageBox.Ok
                 )
 
+    def check_settings_changed(self):
+        """Check if current settings differ from original"""
+        current_settings = self.get_settings()
+        self.apply_btn.setEnabled(current_settings != self.original_settings)
+
+    def save_original_settings(self):
+        """Save the current settings as original state"""
+        self.original_settings = self.get_settings()
+
+    def apply_settings(self):
+        """Apply the current settings"""
+        self.save_settings()
+        self.save_original_settings()
+        self.apply_btn.setEnabled(False)
+        QMessageBox.information(
+            self,
+            "Settings Applied",
+            "Settings have been applied successfully.",
+            QMessageBox.Ok
+        )
+
     def get_settings(self):
         return {
             'quality': self.quality_combo.currentText(),
@@ -1082,7 +1144,8 @@ class SettingsTab(QWidget):
             'retry_attempts': self.retry_spin.value(),
             'concurrent_downloads': self.concurrent_check.isChecked(),
             'auto_rename': self.auto_rename_check.isChecked(),
-            'preserve_source': self.preserve_source_check.isChecked()
+            'preserve_source': self.preserve_source_check.isChecked(),
+            'preset': self.preset_combo.currentText()
         }
 
     def save_settings(self):
@@ -1092,6 +1155,12 @@ class SettingsTab(QWidget):
                 json.dump(settings, f)
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to save settings: {str(e)}",
+                QMessageBox.Ok
+            )
 
     def load_settings(self):
         try:
@@ -1106,7 +1175,9 @@ class SettingsTab(QWidget):
             self.concurrent_check.setChecked(settings.get('concurrent_downloads', False))
             self.auto_rename_check.setChecked(settings.get('auto_rename', True))
             self.preserve_source_check.setChecked(settings.get('preserve_source', True))
+            self.preset_combo.setCurrentText(settings.get('preset', 'Standard'))
         except:
+            # If settings file doesn't exist or is invalid, use defaults
             pass
 
 class M3U8StreamDownloader(QMainWindow):
