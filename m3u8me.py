@@ -624,72 +624,45 @@ class StreamDownloader(QThread):
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
     
-            concat_file = os.path.join(self.temp_dir, 'concat.txt')
-            with open(concat_file, 'w', encoding='utf-8') as f:
-                for segment in segment_files:
-                    f.write(f"file '{segment}'\n")
-    
             output_format = self.settings.get('output_format', 'mp4')
+            temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
             output_file = f"{output_file}.{output_format}"
     
-            # Simplified encoding parameters focused on speed and stability
-            encoding_params = {
-                'mp4': {
-                    'vcodec': 'copy',  # Use copy by default for speed
-                    'acodec': 'copy',
-                    'extra': [
-                        '-movflags', '+faststart',
-                        '-max_muxing_queue_size', '9999',
-                        '-fflags', '+genpts+igndts',
-                        '-avoid_negative_ts', 'make_zero',
-                        '-async', '1'
-                    ]
-                },
-                'mkv': {
-                    'vcodec': 'copy',
-                    'acodec': 'copy',
-                    'extra': [
-                        '-max_muxing_queue_size', '9999',
-                        '-fflags', '+genpts+igndts',
-                        '-async', '1'
-                    ]
-                },
-                'ts': {
-                    'vcodec': 'copy',
-                    'acodec': 'copy',
-                    'extra': [
-                        '-copyts',
-                        '-muxdelay', '0',
-                        '-muxpreload', '0'
-                    ]
-                }
-            }
-    
-            # Only use encoding if explicitly requested and format supports it
-            if self.settings.get('preserve_source', True) and output_format in ['mp4', 'mkv']:
-                encoding_params[output_format]['vcodec'] = 'libx264'
-                encoding_params[output_format]['extra'].extend([
-                    '-preset', 'ultrafast',  # Much faster encoding
-                    '-crf', '23',  # Good balance of quality and speed
-                    '-tune', 'fastdecode'  # Optimize for playback
-                ])
-    
-            params = encoding_params.get(output_format)
+            # STEP 1: Concatenate all segments to a single TS file first
+            self.progress_updated.emit(self.url, 0, "Combining segments...")
             
+            with open(temp_file, 'wb') as outfile:
+                for i, segment in enumerate(segment_files):
+                    with open(segment, 'rb') as infile:
+                        outfile.write(infile.read())
+                    progress = min(int((i / len(segment_files)) * 50), 49)
+                    self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
+    
+            # STEP 2: Convert to final format with fixed timing
+            self.progress_updated.emit(self.url, 50, "Fixing video timing...")
+    
             cmd = [
                 'ffmpeg', '-y',
-                '-hide_banner',
-                '-loglevel', 'warning',
-                '-stats',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c:v', params['vcodec'],
-                '-c:a', params['acodec']
+                '-i', temp_file,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',  # Speed over compression
+                '-tune', 'zerolatency',  # Minimize latency
+                '-profile:v', 'baseline', # Better compatibility
+                '-level', '3.0',
+                '-x264opts', 'no-scenecut', # Prevent frame analysis
+                '-flags', '+cgop',  # Consistent GOP
+                '-r', '30',  # Force 30fps
+                '-g', '30',  # One keyframe per second
+                '-keyint_min', '30',  # Force regular keyframes
+                '-sc_threshold', '0',  # Disable scene change detection
+                '-bf', '0',  # No B-frames
+                '-vsync', 'cfr',  # Constant frame rate
+                '-async', '1',  # Audio sync
+                '-copytb', '1',
+                '-enc_time_base', 'fixed',
+                '-video_track_timescale', '90000',
+                output_file
             ]
-            
-            cmd.extend(params['extra'])
-            cmd.append(output_file)
     
             process = subprocess.Popen(
                 cmd,
@@ -698,150 +671,261 @@ class StreamDownloader(QThread):
                 universal_newlines=True
             )
     
-            # Add timeout for the processing
-            start_time = time.time()
-            timeout = 300  # 5 minutes timeout
-            
             while True:
                 if not self.is_running:
                     process.terminate()
-                    raise Exception("Processing cancelled by user")
-                    
-                if time.time() - start_time > timeout:
-                    process.terminate()
-                    raise Exception("Processing timed out after 5 minutes")
-                    
+                    return False
+    
                 output = process.stderr.readline()
                 if output == '' and process.poll() is not None:
                     break
-                    
-                if 'time=' in output:
+    
+                if 'frame=' in output:
                     try:
-                        time_str = output.split('time=')[1].split()[0]
-                        h, m, s = map(float, time_str.split(':'))
-                        progress = min(99, 90 + int((h * 3600 + m * 60 + s) / 2))
-                        self.progress_updated.emit(self.url, progress, "Processing video...")
+                        frame = int(output.split('frame=')[1].split()[0])
+                        progress = min(50 + int(frame / 500), 99)  # Rough estimate
+                        self.progress_updated.emit(self.url, progress, f"Fixing video timing... {progress}%")
                     except:
                         pass
     
             if process.returncode != 0:
-                raise Exception(f"FFmpeg error: {process.stderr.read().strip()}")
+                raise Exception("Failed to fix video timing")
     
+            # Verify the output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
-                raise Exception("Output file is missing or too small")
+                raise Exception("Output file is invalid")
     
+            self.progress_updated.emit(self.url, 100, "Processing complete!")
             return True
     
         except Exception as e:
             logger.error(f"Error combining segments: {str(e)}")
             return False
+        finally:
+            # Cleanup
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def get_total_duration(self, segment_files):
+        """Calculate total duration of all segments"""
+        try:
+            total_duration = 0
+            for segment in segment_files:
+                cmd = [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    segment
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    total_duration += duration
+            return total_duration
+        except:
+            return 0
+    
+    def verify_video_file(self, file_path):
+        """Verify the output video file is valid"""
+        try:
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_type',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                file_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return result.returncode == 0 and 'video' in result.stdout.strip()
+        except:
+            return False
+            
+    def estimate_remaining_time(self, processed_seconds, total_duration):
+        if total_duration == 0 or processed_seconds == 0:
+            return "calculating..."
+            
+        elapsed = time.time() - self.processing_started
+        if elapsed < 2:  # Need some time to get accurate estimation
+            return "calculating..."
+            
+        rate = processed_seconds / elapsed
+        if rate == 0:
+            return "calculating..."
+            
+        remaining_seconds = (total_duration - processed_seconds) / rate
+        
+        if remaining_seconds < 60:
+            return f"{int(remaining_seconds)}s"
+        else:
+            return str(timedelta(seconds=int(remaining_seconds)))
 
     def run(self):
         try:
             self.temp_dir = tempfile.mkdtemp()
-            parsed_url = urlparse(self.url)
-
-            if self.url.startswith('#EXTM3U'):
-                content = self.url
-            else:
-                response = self.session.get(
-                    self.url,
-                    headers=self.headers,
-                    verify=False,
-                    timeout=30
-                )
-                response.raise_for_status()
-                content = response.text
-
-            playlist = m3u8.loads(content)
-
+    
+            # Clean up the input
+            content = self.url.strip().rstrip(':')
+            
+            # Parse the M3U8 content
+            try:
+                playlist = m3u8.loads(content)
+            except Exception as e:
+                raise Exception(f"Failed to parse M3U8: {str(e)}")
+    
+            # Handle multi-quality streams
             if not playlist.segments and playlist.playlists:
-                playlists = sorted(
-                    playlist.playlists,
-                    key=lambda p: p.stream_info.bandwidth if p.stream_info else 0
-                )
-                
+                # Filter and sort playlists by resolution
+                available_streams = []
+                for p in playlist.playlists:
+                    if hasattr(p.stream_info, 'resolution'):
+                        width, height = p.stream_info.resolution
+                        bandwidth = p.stream_info.bandwidth
+                        available_streams.append({
+                            'playlist': p,
+                            'resolution': f"{width}x{height}",
+                            'height': height,
+                            'bandwidth': bandwidth,
+                            'uri': p.uri
+                        })
+    
+                # Sort by height and bandwidth (for same resolution)
+                available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
+    
+                # Quality selection based on settings
                 quality = self.settings.get('quality', 'best')
+                selected_stream = None
+    
                 if quality == 'best':
-                    selected_playlist = playlists[-1]
+                    # Look specifically for 1080p first
+                    for stream in available_streams:
+                        if stream['height'] == 1080:
+                            selected_stream = stream
+                            break
+                    # If no 1080p, take the highest available
+                    if not selected_stream and available_streams:
+                        selected_stream = available_streams[0]
                 elif quality == 'worst':
-                    selected_playlist = playlists[0]
-                else:
-                    selected_playlist = playlists[len(playlists)//2]
-
-                playlist_url = selected_playlist.uri
-                if not playlist_url.startswith('http'):
-                    base_url = get_base_url(self.url, parsed_url)
-                    playlist_url = urljoin(base_url, playlist_url)
-
-                response = self.session.get(
-                    playlist_url,
-                    headers=self.headers,
-                    verify=False,
-                    timeout=30
+                    selected_stream = available_streams[-1]
+                else:  # medium
+                    selected_stream = available_streams[len(available_streams)//2]
+    
+                if not selected_stream:
+                    raise Exception("No suitable quality stream found")
+    
+                selected_url = selected_stream['uri']
+                resolution = selected_stream['resolution']
+                
+                self.progress_updated.emit(
+                    self.url, 
+                    0, 
+                    f"Selected quality: {resolution} ({selected_stream['bandwidth'] // 1000}kbps)"
                 )
-                response.raise_for_status()
-                playlist = m3u8.loads(response.text)
-                parsed_url = urlparse(playlist_url)
-
+    
+                try:
+                    response = self.session.get(
+                        selected_url,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    playlist = m3u8.loads(response.text)
+                except Exception as e:
+                    raise Exception(f"Failed to fetch quality stream: {str(e)}")
+    
             if not playlist.segments:
                 raise Exception("No segments found in playlist")
-
-            base_url = get_base_url(self.url, parsed_url)
+    
+            # Download segments
+            segment_files = []
             total_segments = len(playlist.segments)
-
-            segment_tasks = []
-            for i, segment in enumerate(playlist.segments):
-                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
-                segment_url = urljoin(base_url, segment.uri)
-                segment_tasks.append((segment_url, output_path, i))
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent_segments) as executor:
-                futures = {
-                    executor.submit(
-                        self.download_segment,
-                        url,
-                        path,
-                        idx,
-                        total_segments
-                    ): idx for url, path, idx in segment_tasks
-                }
-
-                for future in concurrent.futures.as_completed(futures):
-                    if not self.is_running:
-                        executor.shutdown(wait=False)
-                        raise Exception("Download cancelled by user")
-
-                    idx = futures[future]
-                    try:
-                        if not future.result():
-                            raise Exception(f"Failed to download segment {idx}")
-                    except Exception as e:
-                        logger.error(f"Error downloading segment {idx}: {str(e)}")
-                        raise
-
-            if len(self.completed_segments) != total_segments:
-                raise Exception(f"Missing segments. Downloaded {len(self.completed_segments)}/{total_segments}")
-
-            self.progress_updated.emit(self.url, 90, "Processing video...")
             
+            for i, segment in enumerate(playlist.segments):
+                if not self.is_running:
+                    raise Exception("Download cancelled by user")
+    
+                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
+                segment_url = segment.uri
+    
+                # Ensure segment URL is absolute
+                if not segment_url.startswith('http'):
+                    base_url = os.path.dirname(selected_url) if 'selected_url' in locals() else ''
+                    segment_url = f"{base_url}/{segment_url}" if base_url else segment_url
+    
+                try:
+                    response = self.session.get(
+                        segment_url,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    
+                    with open(output_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    segment_files.append(output_path)
+                    progress = min(int((i / total_segments) * 80), 79)
+                    self.progress_updated.emit(
+                        self.url,
+                        progress,
+                        f"Downloading {resolution} segments... {i+1}/{total_segments}"
+                    )
+                    
+                except Exception as e:
+                    raise Exception(f"Failed to download segment {i+1}: {str(e)}")
+    
+            # Combine segments into intermediate file
+            self.progress_updated.emit(self.url, 80, "Combining segments...")
+            intermediate_file = os.path.join(self.temp_dir, "intermediate.ts")
+            
+            with open(intermediate_file, 'wb') as outfile:
+                for segment_file in segment_files:
+                    with open(segment_file, 'rb') as infile:
+                        outfile.write(infile.read())
+    
+            # Convert to desired format while preserving quality
+            self.progress_updated.emit(self.url, 90, f"Converting {resolution} video to final format...")
+            
+            output_format = self.settings.get('output_format', 'mp4')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            quality_info = f"_{self.settings.get('quality', 'best')}"
-            output_file = os.path.join(
-                self.save_path,
-                f"video_{timestamp}{quality_info}"
-            )
-
-            segment_files = [
-                os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
-                for i in range(total_segments)
+            quality_info = f"_{resolution}"
+            output_file = os.path.join(self.save_path, f"video_{timestamp}{quality_info}.{output_format}")
+    
+            # High quality conversion
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', intermediate_file,
+                '-c:v', 'copy',         # Copy video stream to preserve quality
+                '-c:a', 'aac',          # Convert audio to AAC for compatibility
+                '-b:a', '384k',         # High quality audio
+                '-movflags', '+faststart',  # Enable streaming
+                '-metadata', f'resolution={resolution}',  # Add resolution to metadata
+                output_file
             ]
-
-            if self.combine_segments(segment_files, output_file):
-                self.download_complete.emit(self.url)
-            else:
-                raise Exception("Failed to process video")
-
+    
+            process = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+    
+            if process.returncode != 0:
+                raise Exception(f"Failed to convert video: {process.stderr}")
+    
+            # Verify the output file
+            if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
+                raise Exception("Output file is invalid")
+    
+            self.progress_updated.emit(self.url, 100, f"Download complete! ({resolution})")
+            self.download_complete.emit(self.url)
+    
         except Exception as e:
             logger.error(f"Download error: {str(e)}")
             self.download_error.emit(self.url, str(e))
@@ -851,17 +935,6 @@ class StreamDownloader(QThread):
                     shutil.rmtree(self.temp_dir, ignore_errors=True)
                 except:
                     pass
-            try:
-                self.session.close()
-            except:
-                pass
-
-    def stop(self):
-        self.is_running = False
-        try:
-            self.session.close()
-        except:
-            pass
 
 class SettingsTab(QWidget):
     def __init__(self, parent=None):
