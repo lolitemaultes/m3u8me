@@ -1,4 +1,5 @@
 ![logo](https://github.com/user-attachments/assets/98b40949-3c36-4cbf-901e-d906d606ae73)
+
 # m3u8me - Stream Download Made Easy
 ### 🚧 Work In Progress 🚧
 
@@ -11,11 +12,12 @@ m3u8me is a user-friendly tool that helps you download and convert m3u8 streams 
 🐛 Known Issues
 
 1. Segment Merging:
-   - Scene-to-scene transitions in MP4 work but may have minor issues.
-   - TS and MKV files are currently problematic and under review.
+   - m3u8 URLs Unretreivable from the search page as of current.
+   - TS and MKV files have not been tested and may be problematic.
 
 2. Limited Features:
    - Functionality is currently minimal, but we're actively working on updates!
+   - Limited modification ability for m3u8me users.
 
 #
 
@@ -31,7 +33,7 @@ m3u8me is a user-friendly tool that helps you download and convert m3u8 streams 
 
 **🚀 Release Timeline**
 
-A full release is coming soon. Keep an eye out for updates!
+Release 1.1 is now out. Keep an eye out for more future updates!
 
 ---
 
