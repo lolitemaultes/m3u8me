@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+
 import sys
 import os
 import json
@@ -8,14 +20,17 @@ import time
 import logging
 import tempfile
 import shutil
+import threading
 import concurrent.futures
 import threading
 import subprocess
 import importlib.util
+import undetected_chromedriver as uc
 from datetime import datetime
 from collections import deque
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote, quote_plus, urlencode
 from pathlib import Path
+from queue import Queue
 
 import requests
 import m3u8
@@ -24,7 +39,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QProgressBar, QFileDialog, QMessageBox, QTabWidget,
     QComboBox, QSpinBox, QCheckBox, QGridLayout, QScrollArea, QFrame,
-    QGroupBox, QStyle, QStyleFactory, QToolTip, QSystemTrayIcon, QMenu
+    QGroupBox, QStyle, QStyleFactory, QToolTip, QSystemTrayIcon, QMenu, QStackedLayout, QSizePolicy
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QSize, QTimer, QSettings
@@ -1253,6 +1268,680 @@ class SettingsTab(QWidget):
             # If settings file doesn't exist or is invalid, use defaults
             pass
 
+class SearchWorker(QThread):
+    resultFound = pyqtSignal(dict)
+    searchComplete = pyqtSignal()
+    searchError = pyqtSignal(str)
+    progressUpdate = pyqtSignal(int, int)  # current, total
+
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+        self.is_running = True
+
+    def run(self):
+        try:
+            options = Options()
+            options.add_argument('--headless')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            try:
+                search_url = f"https://freecinema.live/search?query={quote_plus(self.query)}"
+                logger.info(f"Loading search URL: {search_url}")
+                
+                driver.get(search_url)
+                
+                # Wait for results
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "movie-card"))
+                )
+                
+                # Get all movie cards
+                movie_cards = driver.find_elements(By.CLASS_NAME, "movie-card")
+                total_cards = len(movie_cards)
+                logger.info(f"Found {total_cards} movie cards")
+                
+                for i, card in enumerate(movie_cards):
+                    if not self.is_running:
+                        break
+                        
+                    try:
+                        # Extract movie information
+                        title = card.get_attribute('title')
+                        url = card.get_attribute('href')
+                        
+                        # Get poster
+                        try:
+                            img = card.find_element(By.CLASS_NAME, "movie-poster")
+                            poster_url = img.get_attribute('src')
+                        except:
+                            poster_url = None
+                            
+                        # Get year
+                        try:
+                            year = card.find_element(By.CLASS_NAME, "text-gray-300").text
+                        except:
+                            year = None
+                        
+                        if title and url:
+                            result = {
+                                'title': title,
+                                'url': url,
+                                'poster_url': poster_url,
+                                'year': year
+                            }
+                            
+                            self.resultFound.emit(result)
+                            self.progressUpdate.emit(i + 1, total_cards)
+                            logger.info(f"Found movie: {title}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error parsing movie card: {str(e)}")
+                        continue
+                
+                self.searchComplete.emit()
+                
+            finally:
+                driver.quit()
+                
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+            self.searchError.emit(str(e))
+
+    def stop(self):
+        self.is_running = False
+
+class SearchTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.search_results = []
+        self.selected_results = []
+        self.results_widget = None
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Search area
+        search_group = QGroupBox("Movie Search")
+        search_layout = QHBoxLayout()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter movie title to search...")
+        self.search_input.returnPressed.connect(self.perform_search)
+        
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.perform_search)
+        
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_btn)
+        
+        search_group.setLayout(search_layout)
+        layout.addWidget(search_group)
+        
+        # Results area with progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet("color: white;")
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+        
+        # Results scroll area
+        self.results_scroll = QScrollArea()
+        self.results_scroll.setWidgetResizable(True)
+        self.results_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        self.results_widget = QWidget()
+        self.results_layout = QVBoxLayout(self.results_widget)
+        self.results_layout.addStretch()
+        
+        self.results_scroll.setWidget(self.results_widget)
+        layout.addWidget(self.results_scroll)
+        
+        # Control buttons
+        self.download_selected_btn = QPushButton("Download Selected")
+        self.download_selected_btn.clicked.connect(self.process_selected)
+        self.download_selected_btn.setEnabled(False)
+        layout.addWidget(self.download_selected_btn)
+
+    def create_result_widget(self, result):
+        widget = QFrame()
+        widget.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        widget.setStyleSheet("""
+            QFrame {
+                background-color: #2a2a2a;
+                border-radius: 5px;
+                padding: 10px;
+                margin: 2px;
+            }
+            QLabel { color: white; }
+            QCheckBox { margin-right: 10px; }
+        """)
+        
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Checkbox for selection
+        checkbox = QCheckBox()
+        checkbox.setStyleSheet("""
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                background-color: #1a1a1a;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #2979ff;
+            }
+        """)
+        checkbox.stateChanged.connect(lambda state: self.toggle_selection(result, state))
+        layout.addWidget(checkbox)
+        
+        # Movie poster
+        poster_label = QLabel()
+        poster_label.setFixedSize(100, 150)
+        poster_label.setStyleSheet("background-color: #1a1a1a; border-radius: 3px;")
+        poster_label.setAlignment(Qt.AlignCenter)
+        
+        if result.get('poster_url'):
+            try:
+                response = requests.get(result['poster_url'])
+                if response.status_code == 200:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(response.content)
+                    poster_label.setPixmap(pixmap.scaled(100, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            except:
+                poster_label.setText("No\nPoster")
+        else:
+            poster_label.setText("No\nPoster")
+            
+        layout.addWidget(poster_label)
+        
+        # Movie info
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(5)
+        
+        # Title and year
+        title_text = result['title']
+        if result.get('year'):
+            title_text += f" ({result['year']})"
+            
+        title_label = QLabel(f"<b>{title_text}</b>")
+        title_label.setWordWrap(True)
+        info_layout.addWidget(title_label)
+        
+        info_layout.addStretch()
+        layout.addLayout(info_layout, stretch=1)
+        
+        return widget
+        
+    def show_error_message(self, error_msg):
+        """Safely display error message in the UI"""
+        error_label = QLabel(f"Search failed: {error_msg}")
+        error_label.setAlignment(Qt.AlignCenter)
+        error_label.setStyleSheet("color: #ff5252; padding: 20px;")
+        error_label.setWordWrap(True)
+        self.results_layout.addWidget(error_label)
+
+    async def search_movies(self, query):
+        self.search_results = []
+        base_url = "https://freecinema.live"
+        
+        params = {
+            'query': query
+        }
+        search_url = f"{base_url}/search?{urlencode(params)}"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1'
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, headers=headers) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        
+                        # Log the first part of the response to see what we're getting
+                        logger.info(f"Response received. First 1000 characters: {html[:1000]}")
+                        
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        # Try to find any links first
+                        all_links = soup.find_all('a')
+                        logger.info(f"Total links found: {len(all_links)}")
+                        
+                        # Try multiple selectors
+                        movie_cards = (
+                            soup.find_all('a', class_='movie-card') or
+                            soup.find_all('div', class_='movie-card') or
+                            soup.find_all('a', class_=lambda x: x and 'movie-card' in x)
+                        )
+                        
+                        logger.info(f"Movie cards found: {len(movie_cards)}")
+                        
+                        if not movie_cards:
+                            # Log more details about what we're finding
+                            logger.info("No movie cards found. Checking HTML structure...")
+                            # Print all classes found in the HTML
+                            all_classes = set()
+                            for tag in soup.find_all(class_=True):
+                                all_classes.update(tag.get('class', []))
+                            logger.info(f"Classes found in HTML: {all_classes}")
+                        
+                        for card in movie_cards:
+                            try:
+                                # Log the card HTML to see what we're working with
+                                logger.info(f"Processing card: {card}")
+                                
+                                # Try multiple approaches to get the title
+                                title = None
+                                for title_selector in [
+                                    ('h3', {'class': 'font-semibold'}),
+                                    ('h3', {}),
+                                    ('div', {'class': 'title'}),
+                                    ('a', {'title': True})
+                                ]:
+                                    title_elem = card.find(*title_selector)
+                                    if title_elem:
+                                        title = title_elem.text.strip()
+                                        if not title and title_selector[0] == 'a':
+                                            title = title_elem.get('title')
+                                        if title:
+                                            break
+                                
+                                if not title:
+                                    # Try getting title from card directly if it's an anchor
+                                    title = card.get('title', '').strip()
+                                
+                                # Get URL
+                                url = card.get('href', '')
+                                if url:
+                                    if not url.startswith('http'):
+                                        url = urljoin(base_url, url)
+                                
+                                # Get poster
+                                img = card.find('img')
+                                poster_url = None
+                                if img:
+                                    poster_url = img.get('src', '')
+                                    if not poster_url.startswith('http'):
+                                        poster_url = urljoin(base_url, poster_url)
+                                
+                                # Get year if available
+                                year = None
+                                year_elem = card.find('p', class_='text-gray-300')
+                                if year_elem:
+                                    year = year_elem.text.strip()
+                                
+                                if title and url:
+                                    self.search_results.append({
+                                        'title': title,
+                                        'url': url,
+                                        'poster_url': poster_url,
+                                        'year': year
+                                    })
+                                    logger.info(f"Added movie: {title}")
+                            
+                            except Exception as e:
+                                logger.error(f"Error parsing movie card: {str(e)}")
+                                continue
+                        
+                        if not self.search_results:
+                            logger.warning("No results were parsed successfully")
+                        
+                        return self.search_results
+                    else:
+                        logger.error(f"Search request failed with status: {response.status}")
+                        logger.error(f"Response text: {await response.text()}")
+                        return []
+                        
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+            return []
+
+    def perform_search(self):
+        query = self.search_input.text().strip()
+        if not query:
+            return
+        
+        # Clear previous results
+        self.clear_results()
+        
+        # Create a container widget for results that we'll add all at once
+        results_container = QWidget()
+        results_container_layout = QVBoxLayout(results_container)
+        results_container_layout.setSpacing(5)
+        
+        # Show progress
+        self.progress_bar.setVisible(True)
+        self.status_label.setVisible(True)
+        self.status_label.setText("Searching...")
+        self.progress_bar.setMaximum(0)  # Indeterminate progress
+        self.search_btn.setEnabled(False)
+        QApplication.processEvents()
+        
+        try:
+            options = Options()
+            options.add_argument('--headless')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            try:
+                search_url = f"https://freecinema.live/search?query={quote_plus(query)}"
+                driver.get(search_url)
+                
+                # Wait for results
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "movie-card"))
+                )
+                
+                # Get all movie cards
+                movie_cards = driver.find_elements(By.CLASS_NAME, "movie-card")
+                total_cards = len(movie_cards)
+                
+                self.progress_bar.setMaximum(total_cards)
+                
+                # Collect results in batches of 5
+                batch_size = 5
+                current_batch = []
+                
+                # Process each card
+                for i, card in enumerate(movie_cards, 1):
+                    try:
+                        title = card.get_attribute('title')
+                        url = card.get_attribute('href')
+                        poster_url = card.find_element(By.CLASS_NAME, "movie-poster").get_attribute('src')
+                        year = card.find_element(By.CLASS_NAME, "text-gray-300").text
+                        
+                        result = {
+                            'title': title,
+                            'url': url,
+                            'poster_url': poster_url,
+                            'year': year
+                        }
+                        
+                        current_batch.append(result)
+                        self.search_results.append(result)
+                        
+                        # Update status without updating UI yet
+                        self.status_label.setText(f"Loading results ({i}/{total_cards})...")
+                        self.progress_bar.setValue(i)
+                        
+                        # When batch is full or on last item, update UI
+                        if len(current_batch) == batch_size or i == total_cards:
+                            # Create widgets for batch
+                            for result in current_batch:
+                                result_widget = self.create_result_widget(result)
+                                results_container_layout.addWidget(result_widget)
+                            
+                            current_batch = []
+                            QApplication.processEvents()
+                        
+                    except Exception as e:
+                        logger.error(f"Error parsing movie card: {str(e)}")
+                        continue
+                        
+            finally:
+                driver.quit()
+                
+            # Add final container with all results
+            results_container_layout.addStretch()
+            self.results_layout.insertWidget(0, results_container)
+                
+        except Exception as e:
+            self.status_label.setText(f"Search failed: {str(e)}")
+            logger.error(f"Search failed: {str(e)}")
+            
+        finally:
+            self.search_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            if self.search_results:
+                self.status_label.setText(f"Found {len(self.search_results)} results")
+            else:
+                self.status_label.setText("No results found")
+
+    def clear_results(self):
+        """Clear all search results"""
+        while self.results_layout.count() > 0:
+            item = self.results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.search_results = []
+        self.selected_results = []
+        self.download_selected_btn.setEnabled(False)
+
+    def display_search_results(self, results):
+        """Safely display search results in the UI"""
+        if not results:
+            no_results = QLabel("No movies found")
+            no_results.setAlignment(Qt.AlignCenter)
+            no_results.setStyleSheet("color: white; padding: 20px;")
+            self.results_layout.addWidget(no_results)
+            return
+            
+        # Create a scroll widget to contain all results
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        
+        # Add all results to the content widget
+        for result in results:
+            result_widget = self.create_result_widget(result)
+            content_layout.addWidget(result_widget)
+        
+        # Add stretch at the end
+        content_layout.addStretch()
+        
+        # Set the content widget to the scroll area
+        scroll.setWidget(content_widget)
+        
+        # Add scroll area to main layout
+        self.results_layout.addWidget(scroll)
+
+    def toggle_selection(self, result, state):
+        if state == Qt.Checked:
+            if result not in self.selected_results:
+                self.selected_results.append(result)
+        else:
+            if result in self.selected_results:
+                self.selected_results.remove(result)
+                
+        self.download_selected_btn.setEnabled(len(self.selected_results) > 0)
+
+    def load_image(self, url):
+        try:
+            data = requests.get(url).content
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            return pixmap
+        except:
+            return QPixmap(100, 150)
+
+    def extract_m3u8_url(self, page_url):
+        """Monitor network traffic for the first media request"""
+        options = uc.ChromeOptions()
+        options.add_argument('--headless')
+        
+        driver = None
+        try:
+            driver = uc.Chrome(options=options)
+            
+            # Add CDP listener for network requests
+            def log_request(msg):
+                try:
+                    request = msg['params']['request']
+                    if request['url'].endswith('.m3u8'):
+                        logger.info(f"Found M3U8 request: {request['url']}")
+                        
+            # Enable network monitoring
+            driver.execute_cdp_cmd('Network.enable', {})
+            
+            logger.info(f"Loading page: {page_url}")
+            driver.get(page_url)
+            
+            # Give a moment for the first request
+            time.sleep(3)
+            
+            # Try to get all request logs
+            logs = driver.get_log('performance')
+            
+            for entry in logs:
+                if 'message' in entry:
+                    message = json.loads(entry['message'])
+                    if 'message' in message:
+                        method = message['message'].get('method', '')
+                        if method == 'Network.requestWillBeSent':
+                            url = message['message'].get('params', {}).get('request', {}).get('url', '')
+                            if '.m3u8' in url:
+                                logger.info(f"Found M3U8 URL: {url}")
+                                return url
+                            
+                            logger.info(f"Checking request: {url}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            return None
+        
+        finally:
+            if driver:
+                driver.quit()
+                
+    def check_media_directly(self, driver):
+        """Direct check of media network requests"""
+        try:
+            script = """
+            return new Promise((resolve) => {
+                let mediaUrls = [];
+                
+                // Create network observer
+                let observer = new PerformanceObserver((list) => {
+                    list.getEntries().forEach(entry => {
+                        if (entry.initiatorType === 'media' || entry.name.includes('.m3u8')) {
+                            mediaUrls.push(entry.name);
+                        }
+                    });
+                });
+                
+                // Observe media requests
+                observer.observe({entryTypes: ['resource']});
+                
+                // Check existing entries
+                performance.getEntriesByType('resource').forEach(entry => {
+                    if (entry.initiatorType === 'media' || entry.name.includes('.m3u8')) {
+                        mediaUrls.push(entry.name);
+                    }
+                });
+                
+                // Return results after a short delay
+                setTimeout(() => resolve(mediaUrls), 1000);
+            });
+            """
+            
+            urls = driver.execute_script(script)
+            for url in urls:
+                if '.m3u8' in url:
+                    return url
+            return None
+        except Exception as e:
+            logger.error(f"Error in direct media check: {e}")
+            return None
+                
+    def is_valid_m3u8_url(self, url):
+        """Validate if URL matches expected pattern"""
+        return bool(
+            url and
+            isinstance(url, str) and
+            '.m3u8' in url and
+            ('zeltroncloud' in url or 'file2' in url)
+        )
+                
+    def print_interesting_requests(self, driver):
+        """Debug helper to print interesting requests"""
+        logger.info("All interesting requests:")
+        for request in driver.requests:
+            if any(term in request.url for term in ['.m3u8', 'vidlink', 'jwplayer', 'video', 'stream']):
+                logger.info(f"URL: {request.url}")
+                logger.info(f"Method: {request.method}")
+                if request.response:
+                    logger.info(f"Status: {request.response.status_code}")
+                logger.info("---")
+
+    def process_selected(self):
+        if not self.selected_results:
+            return
+            
+        self.download_selected_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.status_label.setVisible(True)
+        total = len(self.selected_results)
+        self.progress_bar.setMaximum(total)
+        
+        success_count = 0
+        
+        for i, result in enumerate(self.selected_results, 1):
+            try:
+                current_title = result['title']
+                logger.info(f"Starting extraction for: {current_title}")
+                self.status_label.setText(f"Processing {current_title} ({i}/{total})...")
+                self.progress_bar.setValue(i)
+                QApplication.processEvents()
+                
+                logger.info(f"Movie URL: {result['url']}")
+                
+                # Try extraction
+                m3u8_url = self.extract_m3u8_url(result['url'])
+                
+                if m3u8_url:
+                    logger.info(f"Successfully found M3U8 URL for {current_title}: {m3u8_url}")
+                    self.parent.url_input.setText(m3u8_url)
+                    self.parent.add_url_from_input()
+                    success_count += 1
+                    self.status_label.setText(f"Added {current_title} to download list ({success_count}/{total})")
+                else:
+                    logger.error(f"Failed to find M3U8 URL for {current_title}")
+                    self.status_label.setText(f"Failed to get URL for {current_title}")
+                
+                # Give a short break between movies
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error processing {current_title}: {str(e)}")
+                self.status_label.setText(f"Error processing {current_title}")
+                
+            QApplication.processEvents()
+        
+        self.progress_bar.setVisible(False)
+        if success_count > 0:
+            self.status_label.setText(f"Successfully added {success_count} out of {total} movies")
+        else:
+            self.status_label.setText("Failed to add any movies to download list")
+        self.download_selected_btn.setEnabled(True)
+
 class M3U8StreamDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1272,6 +1961,7 @@ class M3U8StreamDownloader(QMainWindow):
         self.tab_widget = None
         self.download_tab = QWidget()
         self.settings_tab = SettingsTab()
+        self.search_tab = None  # Will be initialized in init_ui
         
         # Then create the UI
         self.init_ui()
@@ -1284,7 +1974,179 @@ class M3U8StreamDownloader(QMainWindow):
         self.load_settings()
         self.check_ffmpeg()
 
-    # Signal-connected methods defined first
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+
+        # Logo
+        logo_container = QWidget()
+        logo_container.setFixedHeight(100)
+        logo_layout = QHBoxLayout(logo_container)
+        
+        logo_label = QLabel()
+        try:
+            logo_pixmap = QPixmap("logo.png")
+            scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(scaled_pixmap)
+        except:
+            logo_label.setText("M3U8ME")
+            logo_label.setStyleSheet("font-size: 24pt; font-weight: bold;")
+            
+        logo_label.setAlignment(Qt.AlignCenter)
+        
+        logo_layout.addStretch()
+        logo_layout.addWidget(logo_label)
+        logo_layout.addStretch()
+        
+        layout.addWidget(logo_container)
+
+        # Create control buttons
+        self.create_buttons()
+        
+        # Initialize downloads area variables
+        self.downloads_area = QScrollArea()
+        self.downloads_widget = QWidget()
+        self.downloads_layout = QVBoxLayout(self.downloads_widget)
+        self.url_input = QLineEdit()
+
+        # Initialize tabs
+        self.tab_widget = QTabWidget()
+        
+        # Create and add Search Tab
+        self.search_tab = SearchTab(self)
+        self.tab_widget.addTab(self.search_tab, "Search")
+        
+        # Create and add Downloads Tab
+        self.download_tab = QWidget()
+        self.init_download_tab()
+        self.tab_widget.addTab(self.download_tab, "Downloads")
+        
+        # Create and add Settings Tab
+        self.settings_tab = SettingsTab()
+        self.tab_widget.addTab(self.settings_tab, "Settings")
+        
+        layout.addWidget(self.tab_widget)
+
+    def create_buttons(self):
+        """Create control buttons and connect signals"""
+        # Add URL button
+        self.add_url_btn = QPushButton("Add URL")
+        self.add_url_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        self.add_url_btn.setToolTip("Add a single URL to the download queue")
+        self.add_url_btn.clicked.connect(self.add_url_from_input)
+    
+        # Bulk upload button
+        self.bulk_upload_btn = QPushButton("Bulk Upload")
+        self.bulk_upload_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        self.bulk_upload_btn.setToolTip("Upload multiple URLs from a file")
+        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
+    
+        # Control buttons
+        self.start_all_btn = QPushButton("Start All")
+        self.start_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_all_btn.setToolTip("Start all pending downloads")
+        self.start_all_btn.clicked.connect(self.start_all_downloads)
+        self.start_all_btn.setEnabled(False)
+    
+        self.stop_all_btn = QPushButton("Stop All")
+        self.stop_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_all_btn.setToolTip("Stop all active downloads")
+        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
+        self.stop_all_btn.setEnabled(False)
+    
+        self.clear_completed_btn = QPushButton("Clear Completed")
+        self.clear_completed_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        self.clear_completed_btn.setToolTip("Remove completed downloads from the list")
+        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
+
+    def init_download_tab(self):
+        layout = QVBoxLayout(self.download_tab)
+
+        # URL input area
+        url_group = QGroupBox("Add Stream")
+        url_layout = QHBoxLayout()
+        
+        self.url_input.setPlaceholderText("Enter M3U8 stream URL or paste M3U8 content")
+        self.url_input.returnPressed.connect(self.add_url_from_input)
+        url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.add_url_btn)
+        url_layout.addWidget(self.bulk_upload_btn)
+        
+        url_group.setLayout(url_layout)
+        layout.addWidget(url_group)
+
+        # Downloads area
+        downloads_group = QGroupBox("Downloads")
+        downloads_layout = QVBoxLayout()
+        
+        self.downloads_area.setWidgetResizable(True)
+        self.downloads_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.downloads_layout.addStretch()
+        self.downloads_area.setWidget(self.downloads_widget)
+        downloads_layout.addWidget(self.downloads_area)
+        
+        downloads_group.setLayout(downloads_layout)
+        layout.addWidget(downloads_group)
+
+        # Control buttons
+        control_group = QGroupBox()
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.start_all_btn)
+        button_layout.addWidget(self.stop_all_btn)
+        button_layout.addWidget(self.clear_completed_btn)
+        
+        control_group.setLayout(button_layout)
+        layout.addWidget(control_group)
+
+    def setup_status_bar(self):
+        self.statusBar().showMessage("Ready")
+        
+        self.status_downloads = QLabel("Downloads: 0")
+        self.status_downloads.setToolTip("Total number of downloads")
+        
+        self.status_active = QLabel("Active: 0")
+        self.status_active.setToolTip("Currently downloading")
+        
+        self.status_completed = QLabel("Completed: 0")
+        self.status_completed.setToolTip("Successfully completed downloads")
+        
+        separator = QLabel(" | ")
+        separator.setStyleSheet("color: #666666;")
+        
+        self.statusBar().addPermanentWidget(self.status_downloads)
+        self.statusBar().addPermanentWidget(separator)
+        self.statusBar().addPermanentWidget(self.status_active)
+        self.statusBar().addPermanentWidget(QLabel(" | "))
+        self.statusBar().addPermanentWidget(self.status_completed)
+
+    def add_download(self, url):
+        if url in self.active_downloads:
+            QMessageBox.warning(
+                self,
+                "Duplicate URL",
+                "This URL is already in the download queue!",
+                QMessageBox.Ok
+            )
+            return
+
+        download_widget = DownloadWidget(url)
+        download_widget.cancel_btn.clicked.connect(lambda: self.remove_download(url))
+        
+        self.downloads_layout.insertWidget(
+            self.downloads_layout.count() - 1,
+            download_widget
+        )
+        
+        self.active_downloads[url] = {
+            'widget': download_widget,
+            'worker': None,
+            'status': 'waiting'
+        }
+
+        self.start_all_btn.setEnabled(True)
+        self.update_status_bar()
+
     def add_url_from_input(self):
         url = self.url_input.text().strip()
         if not url:
@@ -1449,168 +2311,6 @@ class M3U8StreamDownloader(QMainWindow):
                 QMessageBox.Ok
             )
 
-    def create_buttons(self):
-        """Create control buttons and connect signals"""
-        # Add URL button
-        self.add_url_btn = QPushButton("Add URL")
-        self.add_url_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
-        self.add_url_btn.setToolTip("Add a single URL to the download queue")
-        self.add_url_btn.clicked.connect(self.add_url_from_input)
-
-        # Bulk upload button
-        self.bulk_upload_btn = QPushButton("Bulk Upload")
-        self.bulk_upload_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
-        self.bulk_upload_btn.setToolTip("Upload multiple URLs from a file")
-        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
-
-        # Control buttons
-        self.start_all_btn = QPushButton("Start All")
-        self.start_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.start_all_btn.setToolTip("Start all pending downloads")
-        self.start_all_btn.clicked.connect(self.start_all_downloads)
-        self.start_all_btn.setEnabled(False)
-
-        self.stop_all_btn = QPushButton("Stop All")
-        self.stop_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_all_btn.setToolTip("Stop all active downloads")
-        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
-        self.stop_all_btn.setEnabled(False)
-
-        self.clear_completed_btn = QPushButton("Clear Completed")
-        self.clear_completed_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
-        self.clear_completed_btn.setToolTip("Remove completed downloads from the list")
-        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
-
-    def init_ui(self):
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
-    
-        # Logo
-        logo_container = QWidget()
-        logo_container.setFixedHeight(100)
-        logo_layout = QHBoxLayout(logo_container)
-        
-        logo_label = QLabel()
-        try:
-            logo_pixmap = QPixmap("logo.png")
-            scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_label.setPixmap(scaled_pixmap)
-        except:
-            logo_label.setText("M3U8ME")
-            logo_label.setStyleSheet("font-size: 24pt; font-weight: bold;")
-            
-        logo_label.setAlignment(Qt.AlignCenter)
-        
-        logo_layout.addStretch()
-        logo_layout.addWidget(logo_label)
-        logo_layout.addStretch()
-        
-        layout.addWidget(logo_container)
-    
-        # Create control buttons before initializing tabs
-        self.create_buttons()
-        
-        # Main content
-        self.tab_widget = QTabWidget()
-        self.init_download_tab()
-        
-        self.tab_widget.addTab(self.download_tab, "Downloads")
-        self.tab_widget.addTab(self.settings_tab, "Settings")
-        
-        layout.addWidget(self.tab_widget)
-        
-    def init_download_tab(self):
-        layout = QVBoxLayout(self.download_tab)
-
-        # URL input area
-        url_group = QGroupBox("Add Stream")
-        url_layout = QHBoxLayout()
-        
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Enter M3U8 stream URL or paste M3U8 content")
-        self.url_input.returnPressed.connect(self.add_url_from_input)
-        url_layout.addWidget(self.url_input)
-        url_layout.addWidget(self.add_url_btn)
-        url_layout.addWidget(self.bulk_upload_btn)
-        
-        url_group.setLayout(url_layout)
-        layout.addWidget(url_group)
-
-        # Downloads area
-        downloads_group = QGroupBox("Downloads")
-        downloads_layout = QVBoxLayout()
-        
-        self.downloads_area = QScrollArea()
-        self.downloads_area.setWidgetResizable(True)
-        self.downloads_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.downloads_widget = QWidget()
-        self.downloads_layout = QVBoxLayout(self.downloads_widget)
-        self.downloads_layout.addStretch()
-        self.downloads_area.setWidget(self.downloads_widget)
-        downloads_layout.addWidget(self.downloads_area)
-        
-        downloads_group.setLayout(downloads_layout)
-        layout.addWidget(downloads_group)
-
-        # Control buttons
-        control_group = QGroupBox()
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.start_all_btn)
-        button_layout.addWidget(self.stop_all_btn)
-        button_layout.addWidget(self.clear_completed_btn)
-        
-        control_group.setLayout(button_layout)
-        layout.addWidget(control_group)
-
-    def setup_status_bar(self):
-        self.statusBar().showMessage("Ready")
-        
-        self.status_downloads = QLabel("Downloads: 0")
-        self.status_downloads.setToolTip("Total number of downloads")
-        
-        self.status_active = QLabel("Active: 0")
-        self.status_active.setToolTip("Currently downloading")
-        
-        self.status_completed = QLabel("Completed: 0")
-        self.status_completed.setToolTip("Successfully completed downloads")
-        
-        separator = QLabel(" | ")
-        separator.setStyleSheet("color: #666666;")
-        
-        self.statusBar().addPermanentWidget(self.status_downloads)
-        self.statusBar().addPermanentWidget(separator)
-        self.statusBar().addPermanentWidget(self.status_active)
-        self.statusBar().addPermanentWidget(QLabel(" | "))
-        self.statusBar().addPermanentWidget(self.status_completed)
-
-    def add_download(self, url):
-        if url in self.active_downloads:
-            QMessageBox.warning(
-                self,
-                "Duplicate URL",
-                "This URL is already in the download queue!",
-                QMessageBox.Ok
-            )
-            return
-
-        download_widget = DownloadWidget(url)
-        download_widget.cancel_btn.clicked.connect(lambda: self.remove_download(url))
-        
-        self.downloads_layout.insertWidget(
-            self.downloads_layout.count() - 1,
-            download_widget
-        )
-        
-        self.active_downloads[url] = {
-            'widget': download_widget,
-            'worker': None,
-            'status': 'waiting'
-        }
-
-        self.start_all_btn.setEnabled(True)
-        self.update_status_bar()
-
     def remove_download(self, url):
         if url not in self.active_downloads:
             return
@@ -1643,30 +2343,16 @@ class M3U8StreamDownloader(QMainWindow):
         if url not in self.active_downloads:
             return
 
-        save_path = self.save_path
-        if not save_path:
-            save_path = QFileDialog.getExistingDirectory(
-                self,
-                "Select Save Directory",
-                options=QFileDialog.ShowDirsOnly
-            )
-            
-            if not save_path:
-                return
-            
-            self.save_path = save_path
-
         settings = self.settings_tab.get_settings()
         
-        worker = StreamDownloader(url, save_path, settings)
+        worker = StreamDownloader(url, self.save_path, settings)
         worker.progress_updated.connect(self.update_progress)
         worker.download_complete.connect(self.download_finished)
         worker.download_error.connect(self.download_error)
         
         self.active_downloads[url].update({
             'worker': worker,
-            'status': 'downloading'
-        })
+            'status': 'downloading'})
         
         self.active_downloads[url]['widget'].update_status(
             "Initializing download...",
@@ -1826,8 +2512,10 @@ class M3U8StreamDownloader(QMainWindow):
             
             settings.setValue('first_run_complete', True)
 
-    def process_arguments(self):
-        args = sys.argv[1:]
+    def process_arguments(self, args=None):
+        if args is None:
+            args = sys.argv[1:]
+            
         for arg in args:
             if arg.startswith('m3u8me:'):
                 url = arg.replace('m3u8me:', '')
