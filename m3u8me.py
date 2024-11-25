@@ -11,6 +11,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 
 import sys
 import os
@@ -1781,55 +1783,157 @@ class SearchTab(QWidget):
             return QPixmap(100, 150)
 
     def extract_m3u8_url(self, page_url):
-        """Monitor network traffic for the first media request"""
-        options = uc.ChromeOptions()
-        options.add_argument('--headless')
+        """Extract M3U8 URL using Firefox with proper network logging."""
+        import traceback
+        from selenium.webdriver import Firefox
+        from selenium.webdriver.firefox.options import Options
+        from selenium.webdriver.common.by import By
         
         driver = None
+        log_file = f"network_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
         try:
-            driver = uc.Chrome(options=options)
+            # Set up Firefox with DevTools
+            options = Options()
+            options.add_argument('-devtools')
+            options.set_preference('devtools.toolbox.host', 'right')
+            options.set_preference('devtools.toolbox.selectedTool', 'netmonitor')
             
-            # Add CDP listener for network requests
-            def log_request(msg):
-                try:
-                    request = msg['params']['request']
-                    if request['url'].endswith('.m3u8'):
-                        logger.info(f"Found M3U8 request: {request['url']}")
-                        
-            # Enable network monitoring
-            driver.execute_cdp_cmd('Network.enable', {})
+            # Enable verbose network logging
+            options.set_preference('devtools.netmonitor.har.enableAutoExport', True)
+            options.set_preference('devtools.netmonitor.persistlog', True)
             
-            logger.info(f"Loading page: {page_url}")
+            logger.info("1. Starting Firefox...")
+            driver = Firefox(options=options)
+            driver.maximize_window()
+            
+            # Set up network logger BEFORE page load
+            logger.info("2. Setting up network logger...")
+            driver.execute_script("""
+            window.requestLog = [];
+            
+            // Create logger function
+            window.logRequest = function(request) {
+                window.requestLog.push({
+                    url: request.url,
+                    time: new Date().toISOString(),
+                    method: request.method,
+                    headers: request.headers
+                });
+            };
+    
+            // Hook into the network
+            const observer = new PerformanceObserver((list) => {
+                list.getEntries().forEach(entry => {
+                    window.requestLog.push({
+                        url: entry.name,
+                        time: new Date().toISOString(),
+                        type: entry.initiatorType,
+                        duration: entry.duration
+                    });
+                });
+            });
+            observer.observe({entryTypes: ['resource']});
+            """)
+            
+            logger.info("3. Loading page...")
             driver.get(page_url)
+            time.sleep(15)  # Wait for loads
             
-            # Give a moment for the first request
-            time.sleep(3)
+            # Save all network requests to file
+            requests = driver.execute_script("return window.requestLog;")
+            logger.info(f"Captured {len(requests)} network requests")
             
-            # Try to get all request logs
-            logs = driver.get_log('performance')
+            with open(log_file, 'w', encoding='utf-8') as f:
+                f.write(f"=== Network Requests for {page_url} ===\n\n")
+                for req in requests:
+                    f.write("-" * 80 + "\n")
+                    f.write(f"Time: {req.get('time', 'Unknown')}\n")
+                    f.write(f"URL: {req.get('url', 'Unknown')}\n")
+                    f.write(f"Type: {req.get('type', 'Unknown')}\n")
+                    if 'method' in req:
+                        f.write(f"Method: {req['method']}\n")
+                    if 'duration' in req:
+                        f.write(f"Duration: {req['duration']}ms\n")
+                    f.write("\n")
             
-            for entry in logs:
-                if 'message' in entry:
-                    message = json.loads(entry['message'])
-                    if 'message' in message:
-                        method = message['message'].get('method', '')
-                        if method == 'Network.requestWillBeSent':
-                            url = message['message'].get('params', {}).get('request', {}).get('url', '')
-                            if '.m3u8' in url:
-                                logger.info(f"Found M3U8 URL: {url}")
-                                return url
-                            
-                            logger.info(f"Checking request: {url}")
+            logger.info(f"Network requests logged to: {log_file}")
             
+            # Now handle the DevTools URL filter
+            logger.info("4. Clicking Filter URLs button...")
+            # First, make sure DevTools has focus
+            actions = ActionChains(driver)
+            actions.key_down(Keys.F12).key_up(Keys.F12).perform()
+            time.sleep(1)
+            
+            # Try to click the Filter URLs button
+            driver.execute_script("""
+            function clickUrlFilter() {
+                // Try to find and click the Filter URLs button
+                const buttons = Array.from(document.querySelectorAll('button, .devtools-button, .netmonitor-toolbar-button'));
+                for (const button of buttons) {
+                    if (button.textContent.toLowerCase().includes('filter') && 
+                        button.textContent.toLowerCase().includes('url')) {
+                        button.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return clickUrlFilter();
+            """)
+            time.sleep(1)
+            
+            logger.info("5. Typing m3u8 into filter...")
+            # Type m3u8 into the filter
+            actions.send_keys('m3u8').perform()
+            time.sleep(2)
+            
+            # Get the first filtered result
+            logger.info("6. Getting first filtered result...")
+            url = driver.execute_script("""
+            // Try to get the first visible URL after filter
+            const items = document.querySelectorAll('.request-list-item, .network-item');
+            for (const item of items) {
+                if (item.offsetParent !== null) {  // Check if visible
+                    const urlElement = item.querySelector('.url') || 
+                                     item.querySelector('[title*=".m3u8"]');
+                    if (urlElement) {
+                        return urlElement.textContent || urlElement.getAttribute('title');
+                    }
+                }
+            }
+            return null;
+            """)
+            
+            if url and '.m3u8' in url.lower():
+                logger.info(f"Found M3U8 URL: {url}")
+                return url
+                
             return None
             
         except Exception as e:
-            logger.error(f"Error: {str(e)}")
+            logger.error(f"Error extracting M3U8 URL: {str(e)}")
             return None
-        
+            
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def is_valid_m3u8_url(self, url):
+        """Validate if URL matches expected pattern"""
+        try:
+            return bool(
+                url and 
+                isinstance(url, str) and 
+                '.m3u8' in url.lower() and
+                'droxonwave.site' in url.lower()
+            )
+        except:
+            return False
                 
     def check_media_directly(self, driver):
         """Direct check of media network requests"""
