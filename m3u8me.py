@@ -142,147 +142,211 @@ class CustomStyle:
     def apply_dark_theme(app):
         app.setStyle(QStyleFactory.create("Fusion"))
         
-        # Dark theme palette
+        # Dark theme color palette
         dark_palette = QPalette()
-        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.Window, QColor(28, 28, 28))
         dark_palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
         dark_palette.setColor(QPalette.Base, QColor(35, 35, 35))
-        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(42, 42, 42))
         dark_palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
         dark_palette.setColor(QPalette.ToolTipText, QColor(255, 255, 255))
         dark_palette.setColor(QPalette.Text, QColor(255, 255, 255))
-        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.Button, QColor(45, 45, 45))
         dark_palette.setColor(QPalette.ButtonText, QColor(255, 255, 255))
         dark_palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
-        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.Link, QColor(66, 133, 244))
+        dark_palette.setColor(QPalette.Highlight, QColor(66, 133, 244))
         dark_palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
         
         app.setPalette(dark_palette)
         
-        # Enhanced stylesheet
+        # Enhanced stylesheet with modern, clean design
         app.setStyleSheet("""
             QMainWindow {
-                background-color: #353535;
+                background-color: #1c1c1c;
             }
-            QPushButton {
-                background-color: #2979ff;
-                border: none;
-                color: white;
-                padding: 5px 15px;
-                border-radius: 3px;
-                font-weight: bold;
+            
+            /* Main container styling */
+            QWidget {
+                margin: 0;
+                padding: 0;
             }
-            QPushButton:hover {
-                background-color: #1565c0;
-            }
-            QPushButton:pressed {
-                background-color: #0d47a1;
-            }
-            QPushButton:disabled {
-                background-color: #666666;
-            }
-            QLineEdit {
-                padding: 5px;
-                border-radius: 3px;
-                border: 1px solid #666666;
-                background-color: #424242;
-                color: white;
-                selection-background-color: #2979ff;
-            }
-            QProgressBar {
-                border: 1px solid #666666;
-                border-radius: 3px;
-                text-align: center;
-                height: 20px;
-                background-color: #353535;
-            }
-            QProgressBar::chunk {
-                background-color: #2979ff;
-                border-radius: 2px;
-            }
-            QLabel {
-                color: white;
-            }
+            
+            /* Group box styling */
             QGroupBox {
-                border: 1px solid #666666;
-                border-radius: 5px;
-                margin-top: 1em;
-                padding-top: 10px;
-                font-weight: bold;
+                border: 1px solid #3d3d3d;
+                border-radius: 8px;
+                margin-top: 1.5em;
+                padding: 15px;
+                background-color: #2a2a2a;
             }
+            
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 3px 0 3px;
+                left: 15px;
+                padding: 0 5px;
+                color: #ffffff;
+                font-weight: bold;
             }
-            QComboBox {
-                padding: 5px;
-                border-radius: 3px;
-                border: 1px solid #666666;
-                background-color: #424242;
+            
+            /* Button styling */
+            QPushButton {
+                background-color: #2fd492;
                 color: white;
-                min-width: 6em;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+                min-width: 100px;
+                margin: 2px;
             }
+            
+            QPushButton:hover {
+                background-color: #25a270;
+            }
+            
+            QPushButton:pressed {
+                background-color: #1c8159;
+            }
+            
+            QPushButton:disabled {
+                background-color: #383838;
+                color: #888888;
+            }
+            
+            /* Input field styling */
+            QLineEdit {
+                padding: 8px;
+                border-radius: 6px;
+                border: 1px solid #3d3d3d;
+                background-color: #333333;
+                color: white;
+                selection-background-color: #4285f4;
+                margin: 2px;
+            }
+            
+            QLineEdit:focus {
+                border: 1px solid #4285f4;
+            }
+            
+            /* Progress bar styling */
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background-color: #333333;
+                height: 20px;
+                text-align: center;
+                margin: 2px;
+            }
+            
+            QProgressBar::chunk {
+                border-radius: 4px;
+                background-color: #4285f4;
+            }
+            
+            /* Tab widget styling */
+            QTabWidget::pane {
+                border: 1px solid #3d3d3d;
+                border-radius: 8px;
+                top: -1px;
+                background-color: #2a2a2a;
+            }
+            
+            QTabBar::tab {
+                background-color: #333333;
+                color: white;
+                padding: 10px 20px;
+                margin: 2px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            
+            QTabBar::tab:selected {
+                background-color: #4285f4;
+            }
+            
+            QTabBar::tab:hover:!selected {
+                background-color: #3d3d3d;
+            }
+            
+            /* Scroll area styling */
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            
+            QScrollBar:vertical {
+                border: none;
+                background-color: #2a2a2a;
+                width: 10px;
+                margin: 0;
+            }
+            
+            QScrollBar::handle:vertical {
+                background-color: #4d4d4d;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            
+            QScrollBar::handle:vertical:hover {
+                background-color: #5d5d5d;
+            }
+            
+            /* Status bar styling */
+            QStatusBar {
+                background-color: #252525;
+                color: white;
+                border-top: 1px solid #3d3d3d;
+            }
+            
+            QStatusBar QLabel {
+                padding: 3px 6px;
+            }
+            
+            /* Combobox styling */
+            QComboBox {
+                padding: 6px;
+                border-radius: 6px;
+                border: 1px solid #3d3d3d;
+                background-color: #333333;
+                color: white;
+                min-width: 100px;
+            }
+            
             QComboBox::drop-down {
                 border: none;
                 width: 20px;
             }
-            QSpinBox {
-                padding: 5px;
-                border-radius: 3px;
-                border: 1px solid #666666;
-                background-color: #424242;
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid white;
+                margin-right: 5px;
+            }
+            
+            /* Download widget styling */
+            DownloadWidget {
+                background-color: #2d2d2d;
+                border-radius: 8px;
+                padding: 12px;
+                margin: 8px 4px;
+            }
+            
+            DownloadWidget QLabel {
                 color: white;
+                font-size: 13px;
             }
-            QScrollArea {
-                border: 1px solid #666666;
-                border-radius: 3px;
-            }
-            QTabWidget::pane {
-                border: 1px solid #666666;
-                border-radius: 3px;
-                top: -1px;
-            }
-            QTabBar::tab {
-                background-color: #424242;
-                color: white;
-                padding: 8px 20px;
-                border-top-left-radius: 3px;
-                border-top-right-radius: 3px;
-                margin-right: 2px;
-            }
-            QTabBar::tab:selected {
-                background-color: #2979ff;
-            }
-            QTabBar::tab:hover:!selected {
-                background-color: #1565c0;
-            }
-            QCheckBox {
-                color: white;
-                spacing: 5px;
-            }
-            QCheckBox::indicator {
-                width: 15px;
-                height: 15px;
-                border-radius: 3px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 1px solid #666666;
-                background-color: #424242;
-            }
-            QCheckBox::indicator:checked {
-                border: 1px solid #2979ff;
-                background-color: #2979ff;
-            }
-            QToolTip {
-                background-color: #424242;
-                color: white;
-                border: 1px solid #666666;
-                border-radius: 3px;
-                padding: 5px;
+            
+            /* Logo container styling */
+            #logo_container {
+                margin: 20px;
+                padding: 10px;
+                background-color: transparent;
             }
         """)
+
 
 class SystemTrayApp(QSystemTrayIcon):
     def __init__(self, parent=None):
@@ -814,10 +878,10 @@ class StreamDownloader(QThread):
                 available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
     
                 # Quality selection based on settings
-                quality = self.settings.get('quality', 'best')
+                quality = self.settings.get('quality', 'Super Duper!')
                 selected_stream = None
     
-                if quality == 'best':
+                if quality == 'Super Duper!':
                     # Look specifically for 1080p first
                     for stream in available_streams:
                         if stream['height'] == 1080:
@@ -826,9 +890,9 @@ class StreamDownloader(QThread):
                     # If no 1080p, take the highest available
                     if not selected_stream and available_streams:
                         selected_stream = available_streams[0]
-                elif quality == 'worst':
+                elif quality == 'WTF!!?':
                     selected_stream = available_streams[-1]
-                else:  # medium
+                else:  # Ehh...
                     selected_stream = available_streams[len(available_streams)//2]
     
                 if not selected_stream:
@@ -963,32 +1027,34 @@ class SettingsTab(QWidget):
         self.save_original_settings()  # Save initial state
 
     def init_ui(self):
-        layout = QVBoxLayout(self)
+        # Create a scroll area to contain everything
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        # Main container widget that will go inside scroll area
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(10)
         
         # Video Settings
         video_group = QGroupBox("Video Settings")
         video_layout = QGridLayout()
         
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(['best', 'medium', 'worst'])
-        self.quality_combo.setToolTip("Select the video quality for multi-quality streams")
+        self.quality_combo.addItems(['Super Duper!', 'Ehh...', 'WTF!!?'])
         video_layout.addWidget(QLabel("Quality:"), 0, 0)
         video_layout.addWidget(self.quality_combo, 0, 1)
         
         self.format_combo = QComboBox()
         self.format_combo.addItems(['mp4', 'mkv', 'ts'])
-        self.format_combo.setItemData(0, "Best for compatibility and streaming (recommended)", Qt.ToolTipRole)
-        self.format_combo.setItemData(1, "Good for high quality and multiple audio tracks", Qt.ToolTipRole)
-        self.format_combo.setItemData(2, "Raw stream without re-encoding (faster but larger)", Qt.ToolTipRole)
         video_layout.addWidget(QLabel("Output Format:"), 1, 0)
         video_layout.addWidget(self.format_combo, 1, 1)
         
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(['Standard', 'High Quality', 'Small Size'])
-        self.preset_combo.setToolTip("Predefined quality settings for different use cases")
         video_layout.addWidget(QLabel("Quality Preset:"), 2, 0)
         video_layout.addWidget(self.preset_combo, 2, 1)
-        self.preset_combo.currentTextChanged.connect(self.apply_preset)
         
         video_group.setLayout(video_layout)
         layout.addWidget(video_group)
@@ -999,28 +1065,24 @@ class SettingsTab(QWidget):
         
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 16)
-        self.thread_spin.setValue(4)
-        self.thread_spin.setToolTip("Number of concurrent segment downloads")
+        self.thread_spin.setValue(16)
         download_layout.addWidget(QLabel("Download Threads:"), 0, 0)
         download_layout.addWidget(self.thread_spin, 0, 1)
         
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(5, 120)
-        self.timeout_spin.setValue(30)
-        self.timeout_spin.setToolTip("Timeout in seconds for each segment download")
+        self.timeout_spin.setValue(50)
         download_layout.addWidget(QLabel("Segment Timeout (s):"), 1, 0)
         download_layout.addWidget(self.timeout_spin, 1, 1)
         
         self.retry_spin = QSpinBox()
         self.retry_spin.setRange(0, 5)
-        self.retry_spin.setValue(3)
-        self.retry_spin.setToolTip("Number of retry attempts for failed downloads")
+        self.retry_spin.setValue(5)
         download_layout.addWidget(QLabel("Retry Attempts:"), 2, 0)
         download_layout.addWidget(self.retry_spin, 2, 1)
         
         self.concurrent_check = QCheckBox("Download Streams Concurrently")
         self.concurrent_check.setChecked(False)
-        self.concurrent_check.setToolTip("Download multiple streams at the same time")
         download_layout.addWidget(self.concurrent_check, 3, 0, 1, 2)
         
         download_group.setLayout(download_layout)
@@ -1030,83 +1092,69 @@ class SettingsTab(QWidget):
         plugin_group = QGroupBox("Plugin Management")
         plugin_layout = QVBoxLayout()
         
-        # Plugin list
+        button_layout = QHBoxLayout()
+        install_btn = QPushButton("Install Plugin")
+        install_btn.clicked.connect(self.install_plugin)
+        refresh_btn = QPushButton("Refresh Plugins")
+        refresh_btn.clicked.connect(self.refresh_plugins)
+        button_layout.addWidget(install_btn)
+        button_layout.addWidget(refresh_btn)
+        plugin_layout.addLayout(button_layout)
+        
         self.plugin_list = QScrollArea()
         self.plugin_list.setWidgetResizable(True)
-        self.plugin_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.plugin_list_widget = QWidget()
         self.plugin_list_layout = QVBoxLayout(self.plugin_list_widget)
         self.plugin_list.setWidget(self.plugin_list_widget)
-        
-        # Plugin controls
-        plugin_buttons = QHBoxLayout()
-        
-        install_btn = QPushButton("Install Plugin")
-        install_btn.clicked.connect(self.install_plugin)
-        plugin_buttons.addWidget(install_btn)
-        
-        refresh_btn = QPushButton("Refresh Plugins")
-        refresh_btn.clicked.connect(self.refresh_plugins)
-        plugin_buttons.addWidget(refresh_btn)
-        
-        plugin_layout.addLayout(plugin_buttons)
         plugin_layout.addWidget(self.plugin_list)
+        
         plugin_group.setLayout(plugin_layout)
         layout.addWidget(plugin_group)
-        
-        self.refresh_plugins()
-        
+
         # Output Settings
         output_group = QGroupBox("Output Settings")
-        output_layout = QGridLayout()
+        output_layout = QVBoxLayout()
         
         self.auto_rename_check = QCheckBox("Auto-rename on conflict")
         self.auto_rename_check.setChecked(True)
-        self.auto_rename_check.setToolTip("Automatically rename files if they already exist")
-        output_layout.addWidget(self.auto_rename_check, 0, 0)
+        output_layout.addWidget(self.auto_rename_check)
         
         self.preserve_source_check = QCheckBox("Preserve source quality")
         self.preserve_source_check.setChecked(True)
-        self.preserve_source_check.setToolTip("Maintain original video quality when possible")
-        output_layout.addWidget(self.preserve_source_check, 1, 0)
+        output_layout.addWidget(self.preserve_source_check)
         
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
-        
+
         # Apply Button
         button_layout = QHBoxLayout()
         self.apply_btn = QPushButton("Apply Changes")
         self.apply_btn.clicked.connect(self.apply_settings)
-        self.apply_btn.setEnabled(False)  # Initially disabled
+        self.apply_btn.setEnabled(False)
         button_layout.addStretch()
         button_layout.addWidget(self.apply_btn)
         layout.addLayout(button_layout)
-        
-        # Connect all settings controls to update checker
-        self.quality_combo.currentTextChanged.connect(self.check_settings_changed)
-        self.format_combo.currentTextChanged.connect(self.check_settings_changed)
-        self.thread_spin.valueChanged.connect(self.check_settings_changed)
-        self.timeout_spin.valueChanged.connect(self.check_settings_changed)
-        self.retry_spin.valueChanged.connect(self.check_settings_changed)
-        self.concurrent_check.stateChanged.connect(self.check_settings_changed)
-        self.auto_rename_check.stateChanged.connect(self.check_settings_changed)
-        self.preserve_source_check.stateChanged.connect(self.check_settings_changed)
-        self.preset_combo.currentTextChanged.connect(self.check_settings_changed)
 
-        # Add a spacer at the bottom
-        layout.addStretch()
+        # Put the container in the scroll area
+        scroll.setWidget(container)
+        
+        # Main layout for the tab
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(scroll)
+        
+        self.refresh_plugins()
 
     def apply_preset(self, preset):
         if preset == 'High Quality':
-            self.quality_combo.setCurrentText('best')
+            self.quality_combo.setCurrentText('Super Duper!')
             self.format_combo.setCurrentText('mkv')
             self.preserve_source_check.setChecked(True)
         elif preset == 'Small Size':
-            self.quality_combo.setCurrentText('medium')
+            self.quality_combo.setCurrentText('Ehh...')
             self.format_combo.setCurrentText('mp4')
             self.preserve_source_check.setChecked(False)
         else:  # Standard
-            self.quality_combo.setCurrentText('best')
+            self.quality_combo.setCurrentText('Super Duper!')
             self.format_combo.setCurrentText('mp4')
             self.preserve_source_check.setChecked(True)
 
@@ -1257,7 +1305,7 @@ class SettingsTab(QWidget):
             with open('m3u8_settings.json', 'r') as f:
                 settings = json.load(f)
                 
-            self.quality_combo.setCurrentText(settings.get('quality', 'best'))
+            self.quality_combo.setCurrentText(settings.get('quality', 'Super Duper!'))
             self.format_combo.setCurrentText(settings.get('output_format', 'mp4'))
             self.thread_spin.setValue(settings.get('max_workers', 4))
             self.timeout_spin.setValue(settings.get('segment_timeout', 30))
@@ -1359,23 +1407,35 @@ class SearchWorker(QThread):
 class M3U8StreamDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
-        # First initialize all instance variables
+        # Initialize all instance variables first
         self.force_quit = False
         self.setWindowTitle("M3U8 Stream Downloader")
         self.setMinimumSize(900, 700)
         self.active_downloads = {}
         self.save_path = None
-        self.url_input = None
-        self.downloads_area = None
-        self.downloads_widget = None
-        self.downloads_layout = None
-        self.start_all_btn = None
-        self.stop_all_btn = None
-        self.clear_completed_btn = None
-        self.tab_widget = None
+        
+        # Create UI elements
+        self.url_input = QLineEdit()
+        self.downloads_area = QScrollArea()
+        self.downloads_widget = QWidget()
+        self.downloads_layout = QVBoxLayout(self.downloads_widget)
+        
+        # Initialize buttons
+        self.start_all_btn = QPushButton("Start All")
+        self.stop_all_btn = QPushButton("Stop All")
+        self.clear_completed_btn = QPushButton("Clear Completed")
+        self.add_url_btn = QPushButton("Add URL")
+        self.bulk_upload_btn = QPushButton("Bulk Upload")
+        
+        # Initialize tabs
         self.download_tab = QWidget()
         self.settings_tab = SettingsTab()
-        self.search_tab = None  # Will be initialized in init_ui
+        self.tab_widget = QTabWidget()
+        
+        # Status labels
+        self.status_downloads = QLabel("Downloads: 0")
+        self.status_active = QLabel("Active: 0")
+        self.status_completed = QLabel("Completed: 0")
         
         # Then create the UI
         self.init_ui()
@@ -1392,51 +1452,53 @@ class M3U8StreamDownloader(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
+        layout.setContentsMargins(20, 10, 20, 10)
+        layout.setSpacing(15)
 
-        # Logo
+        # Logo container
         logo_container = QWidget()
-        logo_container.setFixedHeight(100)
+        logo_container.setObjectName("logo_container")
+        logo_container.setFixedHeight(120)
         logo_layout = QHBoxLayout(logo_container)
+        logo_layout.setContentsMargins(0, 10, 0, 10)
         
         logo_label = QLabel()
         try:
             logo_pixmap = QPixmap("logo.png")
-            scaled_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled_pixmap = logo_pixmap.scaled(480, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(scaled_pixmap)
         except:
             logo_label.setText("M3U8ME")
-            logo_label.setStyleSheet("font-size: 24pt; font-weight: bold;")
-            
-        logo_label.setAlignment(Qt.AlignCenter)
+            logo_label.setStyleSheet("font-size: 32px; font-weight: bold; color: #4285f4;")
         
+        logo_label.setAlignment(Qt.AlignCenter)
         logo_layout.addStretch()
         logo_layout.addWidget(logo_label)
         logo_layout.addStretch()
         
         layout.addWidget(logo_container)
 
-        # Create control buttons
-        self.create_buttons()
-        
-        # Initialize downloads area variables
-        self.downloads_area = QScrollArea()
-        self.downloads_widget = QWidget()
-        self.downloads_layout = QVBoxLayout(self.downloads_widget)
-        self.url_input = QLineEdit()
+        # Set up URL input
+        self.url_input.setPlaceholderText("URLs go here, or you can go away and bulk upload...")
+        self.url_input.returnPressed.connect(self.add_url_from_input)
 
         # Initialize tabs
-        self.tab_widget = QTabWidget()
-        
-        # Create and add Downloads Tab
-        self.download_tab = QWidget()
         self.init_download_tab()
         self.tab_widget.addTab(self.download_tab, "Downloads")
-        
-        # Create and add Settings Tab
-        self.settings_tab = SettingsTab()
         self.tab_widget.addTab(self.settings_tab, "Settings")
         
         layout.addWidget(self.tab_widget)
+
+        # Connect button signals
+        self.start_all_btn.clicked.connect(self.start_all_downloads)
+        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
+        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
+        self.add_url_btn.clicked.connect(self.add_url_from_input)
+        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
+
+        # Set initial button states
+        self.start_all_btn.setEnabled(False)
+        self.stop_all_btn.setEnabled(False)
 
     def create_buttons(self):
         """Create control buttons and connect signals"""
@@ -1477,7 +1539,7 @@ class M3U8StreamDownloader(QMainWindow):
         url_group = QGroupBox("Add Stream")
         url_layout = QHBoxLayout()
         
-        self.url_input.setPlaceholderText("Enter M3U8 stream URL or paste M3U8 content")
+        self.url_input.setPlaceholderText("URLs go here, or you can go away and bulk upload...")
         self.url_input.returnPressed.connect(self.add_url_from_input)
         url_layout.addWidget(self.url_input)
         url_layout.addWidget(self.add_url_btn)
