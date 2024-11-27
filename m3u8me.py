@@ -1464,7 +1464,7 @@ class M3U8StreamDownloader(QMainWindow):
         
         logo_label = QLabel()
         try:
-            logo_pixmap = QPixmap("logo.png")
+            logo_pixmap = QPixmap("/Resources/logo.png")
             scaled_pixmap = logo_pixmap.scaled(480, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(scaled_pixmap)
         except:
