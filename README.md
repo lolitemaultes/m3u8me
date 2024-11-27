@@ -1,4 +1,5 @@
-![logo](https://github.com/user-attachments/assets/98b40949-3c36-4cbf-901e-d906d606ae73)
+![logo](https://github.com/user-attachments/assets/0be2b9aa-e000-4cca-95b8-35fe141a077c)
+
 
 # m3u8me - Stream Download Made Easy
 ### 🚧 Work In Progress 🚧
