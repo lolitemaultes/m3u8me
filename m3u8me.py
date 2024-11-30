@@ -904,69 +904,30 @@ class StreamDownloader(QThread):
             output_file = f"{output_file}.{output_format}"
     
             # STEP 1: Concatenate segments with progress tracking
-            self.progress_updated.emit(self.url, 0, "Combining segments...")
+            self.progress_updated.emit(self.url, 80, "Combining segments...")
             
             with open(temp_file, 'wb') as outfile:
                 for i, segment in enumerate(segment_files):
+                    if not self.is_running:
+                        return False
                     with open(segment, 'rb') as infile:
                         outfile.write(infile.read())
-                    progress = min(int((i / len(segment_files)) * 50), 49)
+                    progress = min(80 + int((i / len(segment_files)) * 10), 89)
                     self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
     
-            # STEP 2: Convert with quality preservation
-            self.progress_updated.emit(self.url, 50, "Processing video...")
+            # STEP 2: Convert with improved progress tracking and timeout handling
+            self.progress_updated.emit(self.url, 90, "Processing video...")
     
-            # Base command with input
             cmd = [
                 'ffmpeg', '-y',
                 '-fflags', '+genpts+igndts',
-                '-i', temp_file
-            ]
-    
-            # Quality-specific encoding parameters
-            if quality == 'Super Duper!':
-                # High quality - minimal compression
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'slow',          # Better compression
-                    '-crf', '18',              # High quality (lower value = higher quality)
-                    '-profile:v', 'high',
-                    '-level', '4.1',
-                    '-c:a', 'aac',
-                    '-b:a', '320k',            # High quality audio
-                ])
-            elif quality == 'WTF!!?':
-                # Low quality - maximum compression
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-crf', '28',              # Lower quality
-                    '-profile:v', 'baseline',
-                    '-level', '3.0',
-                    '-c:a', 'aac',
-                    '-b:a', '128k',            # Lower quality audio
-                ])
-            else:  # Ehh...
-                # Medium quality - balanced
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-crf', '23',              # Medium quality
-                    '-profile:v', 'main',
-                    '-level', '4.0',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',            # Medium quality audio
-                ])
-    
-            # Common parameters for all quality levels
-            cmd.extend([
-                '-max_muxing_queue_size', '1024',
-                '-vsync', 'passthrough',
-                '-copyts',
-                '-start_at_zero',
+                '-i', temp_file,
+                '-c:v', 'libx264',
+                '-preset', 'medium',  # Changed from 'slow' for better performance
+                '-crf', '23',        # Balanced quality/size
                 '-movflags', '+faststart',
                 output_file
-            ])
+            ]
     
             process = subprocess.Popen(
                 cmd,
@@ -975,26 +936,48 @@ class StreamDownloader(QThread):
                 universal_newlines=True
             )
     
+            # Add timeout handling
+            start_time = time.time()
+            timeout = 3600  # 1 hour timeout
+            last_progress_time = time.time()
+            progress_timeout = 300  # 5 minutes without progress
+    
             while True:
                 if not self.is_running:
                     process.terminate()
                     return False
     
-                output = process.stderr.readline()
-                if output == '' and process.poll() is not None:
+                # Check overall timeout
+                if time.time() - start_time > timeout:
+                    process.terminate()
+                    raise Exception("Processing timeout exceeded (1 hour)")
+    
+                # Check progress timeout
+                if time.time() - last_progress_time > progress_timeout:
+                    process.terminate()
+                    raise Exception("No progress detected for 5 minutes")
+    
+                # Poll process
+                retcode = process.poll()
+                if retcode is not None:
+                    if retcode != 0:
+                        _, stderr = process.communicate()
+                        raise Exception(f"FFmpeg error: {stderr}")
                     break
     
-                if 'frame=' in output:
-                    try:
-                        frame = int(output.split('frame=')[1].split()[0])
-                        progress = min(50 + int(frame / 500), 99)
-                        self.progress_updated.emit(self.url, progress, f"Processing video... {progress}%")
-                    except:
-                        pass
+                # Read output for progress
+                output = process.stderr.readline()
+                if output:
+                    if 'frame=' in output:
+                        last_progress_time = time.time()
+                        try:
+                            frame = int(output.split('frame=')[1].split()[0])
+                            progress = min(90 + int(frame / 500), 99)
+                            self.progress_updated.emit(self.url, progress, f"Processing video... {progress}%")
+                        except:
+                            pass
     
-            if process.returncode != 0:
-                _, stderr = process.communicate()
-                raise Exception(f"FFmpeg error: {stderr}")
+                time.sleep(0.1)
     
             # Verify the output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
