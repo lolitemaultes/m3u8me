@@ -22,7 +22,7 @@ M3U8me is a user-friendly tool that helps you download and convert M3U8 streams 
 
 ## 🚀 Release Timeline
 
-Release 1.1 is now out. Keep an eye out for more future updates!
+First version will release soon.
 
 ## 📥 Test M3U8 URLs
 
