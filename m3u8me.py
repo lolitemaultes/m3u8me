@@ -903,117 +903,56 @@ class StreamDownloader(QThread):
             temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
             output_file = f"{output_file}.{output_format}"
     
-            # STEP 1: Fast segment combination
-            self.progress_updated.emit(self.url, 80, "Combining segments...")
+            # STEP 1: Combine segments
+            self.progress_updated.emit(self.url, 0, "Combining segments...")
             
-            # Use larger buffer for faster writes
             with open(temp_file, 'wb', buffering=64*1024) as outfile:
                 for i, segment in enumerate(segment_files):
                     if not self.is_running:
                         return False
                     with open(segment, 'rb') as infile:
                         shutil.copyfileobj(infile, outfile, length=64*1024)
-                    progress = min(80 + int((i / len(segment_files)) * 10), 89)
+                    progress = int((i / len(segment_files)) * 100)
                     self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
     
-            # STEP 2: Hardware accelerated conversion
-            self.progress_updated.emit(self.url, 90, "Processing video...")
+            self.progress_updated.emit(self.url, 100, "Processing video...")
     
-            # Try to detect available hardware acceleration
-            hwaccel = None
-            try:
-                # Check for NVIDIA GPU
-                nvidia_smi = shutil.which('nvidia-smi')
-                if nvidia_smi:
-                    hwaccel = 'cuda'
-                else:
-                    # Check for Intel QuickSync
-                    if os.name == 'nt':  # Windows
-                        hwaccel = 'qsv'
-                    else:  # Linux/Mac
-                        hwaccel = 'vaapi'
-            except:
-                pass
-    
-            # Base command with hardware acceleration if available
+            # STEP 2: Simple and reliable CPU encoding
             cmd = ['ffmpeg', '-y']
-            
-            if hwaccel:
-                if hwaccel == 'cuda':
-                    cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-                elif hwaccel == 'qsv':
-                    cmd.extend(['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv'])
-                elif hwaccel == 'vaapi':
-                    cmd.extend(['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi'])
     
             # Input options
             cmd.extend([
-                '-fflags', '+genpts+igndts',
                 '-i', temp_file
             ])
     
-            # Quality-specific encoding settings
+            # Quality-based settings
             if quality == 'Super Duper!':
-                if hwaccel == 'cuda':
-                    cmd.extend([
-                        '-c:v', 'h264_nvenc',
-                        '-preset', 'p4',
-                        '-tune', 'hq',
-                        '-rc:v', 'vbr',
-                        '-b:v', '5M',
-                        '-maxrate:v', '8M'
-                    ])
-                elif hwaccel == 'qsv':
-                    cmd.extend([
-                        '-c:v', 'h264_qsv',
-                        '-preset', 'faster',
-                        '-b:v', '5M'
-                    ])
-                else:
-                    cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'veryfast',
-                        '-crf', '18'
-                    ])
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-crf', '18'
+                ])
             elif quality == 'WTF!!?':
-                if hwaccel == 'cuda':
-                    cmd.extend([
-                        '-c:v', 'h264_nvenc',
-                        '-preset', 'p7',
-                        '-rc:v', 'vbr',
-                        '-b:v', '1M'
-                    ])
-                else:
-                    cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '28'
-                    ])
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-crf', '28'
+                ])
             else:  # Ehh...
-                if hwaccel == 'cuda':
-                    cmd.extend([
-                        '-c:v', 'h264_nvenc',
-                        '-preset', 'p6',
-                        '-rc:v', 'vbr',
-                        '-b:v', '3M'
-                    ])
-                else:
-                    cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '23'
-                    ])
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-crf', '23'
+                ])
     
             # Common output options
             cmd.extend([
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-movflags', '+faststart',
-                '-y',
                 output_file
             ])
     
-            # Start conversion process
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1022,16 +961,16 @@ class StreamDownloader(QThread):
                 bufsize=1
             )
     
+            last_frame = None
+            last_fps = None
             start_time = time.time()
-            last_progress_time = time.time()
-            last_progress = 90
+            last_update = time.time()
     
             while True:
                 if not self.is_running:
                     process.terminate()
                     return False
     
-                # Check for completion or error
                 retcode = process.poll()
                 if retcode is not None:
                     if retcode != 0:
@@ -1039,22 +978,35 @@ class StreamDownloader(QThread):
                         raise Exception(f"FFmpeg error: {stderr}")
                     break
     
-                # Fast progress approximation based on time
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    # Update progress every 0.5 seconds
-                    if time.time() - last_progress_time >= 0.5:
-                        progress = min(90 + int(elapsed), 99)
-                        if progress > last_progress:
-                            last_progress = progress
-                            last_progress_time = time.time()
-                            self.progress_updated.emit(
-                                self.url, 
-                                progress,
-                                "Processing video..."
-                            )
+                # Update progress info every 0.5 seconds
+                if time.time() - last_update >= 0.5:
+                    stderr_line = process.stderr.readline()
+                    if 'frame=' in stderr_line:
+                        try:
+                            # Extract frame number and FPS
+                            frame_match = re.search(r'frame=\s*(\d+)', stderr_line)
+                            fps_match = re.search(r'fps=\s*(\d+)', stderr_line)
+                            speed_match = re.search(r'speed=\s*(\d+.\d+)x', stderr_line)
+                            
+                            if frame_match and fps_match:
+                                current_frame = int(frame_match.group(1))
+                                current_fps = int(fps_match.group(1))
+                                current_speed = float(speed_match.group(1)) if speed_match else 0
+                                
+                                status = f"Processing video... Frame {current_frame}"
+                                if current_fps > 0:
+                                    status += f" ({current_fps} fps"
+                                    if current_speed > 0:
+                                        status += f", {current_speed:.1f}x"
+                                    status += ")"
+                                
+                                self.progress_updated.emit(self.url, 100, status)
+                                
+                        except Exception as e:
+                            pass
+                            
+                    last_update = time.time()
     
-                # Prevent CPU overuse
                 time.sleep(0.1)
     
             # Verify output
