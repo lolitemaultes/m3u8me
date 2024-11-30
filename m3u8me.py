@@ -979,9 +979,25 @@ class StreamDownloader(QThread):
                     progress = int((i / len(segment_files)) * 100)
                     self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
     
-            self.progress_updated.emit(self.url, 100, "Processing video...")
+            self.progress_updated.emit(self.url, 100, "Analyzing video...")
     
-            # STEP 2: Analyze streams
+            # STEP 2: Get total frame count
+            frame_count_cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-count_packets',
+                '-show_entries', 'stream=nb_read_packets',
+                '-of', 'csv=p=0',
+                temp_file
+            ]
+            
+            try:
+                total_frames = int(subprocess.check_output(frame_count_cmd).decode().strip())
+            except:
+                total_frames = None
+    
+            # STEP 3: Analyze streams
             probe_cmd = [
                 'ffprobe',
                 '-v', 'quiet',
@@ -1048,17 +1064,16 @@ class StreamDownloader(QThread):
                     '-crf', '23'
                 ])
     
-            # Audio codec settings for all audio streams
+            # Audio and subtitle settings remain the same
             cmd.extend([
                 '-c:a', 'aac',
                 '-b:a', '128k'
             ])
     
-            # Copy subtitles without re-encoding
             if subtitle_streams:
                 cmd.extend(['-c:s', 'copy'])
     
-            # Metadata for audio and subtitle streams
+            # Metadata settings remain the same
             for i, stream in enumerate(audio_streams):
                 lang = stream.get('tags', {}).get('language', f'und_{i}')
                 cmd.extend([
@@ -1114,12 +1129,18 @@ class StreamDownloader(QThread):
                             fps_match = re.search(r'fps=\s*(\d+)', stderr_line)
                             speed_match = re.search(r'speed=\s*(\d+.\d+)x', stderr_line)
                             
-                            if frame_match and fps_match:
+                            if frame_match:
                                 current_frame = int(frame_match.group(1))
-                                current_fps = int(fps_match.group(1))
+                                current_fps = int(fps_match.group(1)) if fps_match else 0
                                 current_speed = float(speed_match.group(1)) if speed_match else 0
                                 
-                                status = f"Processing video... Frame {current_frame}"
+                                status = f"Processing video... "
+                                if total_frames:
+                                    progress_percent = min(100, int((current_frame / total_frames) * 100))
+                                    status += f"Frame {current_frame}/{total_frames} ({progress_percent}%)"
+                                else:
+                                    status += f"Frame {current_frame}"
+                                    
                                 if current_fps > 0:
                                     status += f" ({current_fps} fps"
                                     if current_speed > 0:
