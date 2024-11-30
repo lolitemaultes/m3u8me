@@ -75,6 +75,21 @@ def get_base_url(url, parsed_url):
         return os.path.dirname(url) + '/'
     return parsed_url.scheme + '://' + parsed_url.netloc + os.path.dirname(parsed_url.path) + '/'
 
+class RateLimiter:
+    def __init__(self, max_per_second=2):
+        self.delay = 1.0 / max_per_second
+        self.last_call = 0
+        self.lock = threading.Lock()
+        
+    def wait(self):
+        with self.lock:
+            elapsed = time.time() - self.last_call
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self.last_call = time.time()
+
+rate_limiter = RateLimiter(max_per_second=2)
+
 class PluginManager:
     def __init__(self):
         self.plugins = {}
@@ -581,14 +596,39 @@ class StreamDownloader(QThread):
         self.session = self._configure_session()
         
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
+            'Origin': 'https://tralvoxmoon.xyz',
+            'Referer': 'https://tralvoxmoon.xyz/',
+            'Connection': 'keep-alive',
+            'Range': 'bytes=0-',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache'
         }
 
     def _configure_session(self):
         session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Origin': 'https://tralvoxmoon.xyz',
+            'Referer': 'https://tralvoxmoon.xyz/',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
+            'TE': 'trailers'
+        })
+        
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=self.max_concurrent_segments,
             pool_maxsize=self.max_concurrent_segments,
@@ -729,53 +769,37 @@ class StreamDownloader(QThread):
                 while active_workers.is_set():
                     try:
                         try:
-                            i, segment_url, output_path = segment_queue.get(timeout=1)  # 1 second timeout
+                            i, segment_url, output_path = segment_queue.get(timeout=1)
                         except queue.Empty:
-                            continue  # Keep trying until active_workers is cleared
-    
+                            continue
+            
                         try:
-                            response = self.session.get(
-                                segment_url,
-                                headers=self.headers,
-                                verify=False,
-                                timeout=30,
-                                stream=True
-                            )
-                            response.raise_for_status()
-    
-                            with open(output_path, 'wb') as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    if not active_workers.is_set():
-                                        return
-                                    if chunk:
-                                        f.write(chunk)
-    
-                            # Verify segment size
-                            if os.path.getsize(output_path) < 100:
-                                raise Exception(f"Segment {i} is too small")
-    
-                            results[i] = output_path
-                            current_completed = increment_counter()
-    
-                            # Update progress
-                            progress = min(int((current_completed / total_segments) * 80), 79)
-                            self.progress_updated.emit(
-                                self.url,
-                                progress,
-                                f"Downloading segments... {current_completed}/{total_segments} ({max_workers} threads)"
-                            )
-    
+                            if self.download_segment_with_retry(segment_url, output_path):
+                                results[i] = output_path
+                                current_completed = increment_counter()
+            
+                                progress = min(int((current_completed / total_segments) * 80), 79)
+                                self.progress_updated.emit(
+                                    self.url,
+                                    progress,
+                                    f"Downloading segments... {current_completed}/{total_segments} ({max_workers} threads)"
+                                )
+                            else:
+                                with counter_lock:
+                                    failed_segments.add(i)
+                                    download_errors.append(f"Segment {i}: Download cancelled")
+            
                         except Exception as e:
                             with counter_lock:
                                 failed_segments.add(i)
                                 download_errors.append(f"Segment {i}: {str(e)}")
-    
+            
                         finally:
                             segment_queue.task_done()
-    
+            
                     except Exception as e:
                         logger.error(f"Worker thread error: {str(e)}")
-                        continue  # Keep trying until active_workers is cleared
+                        continue
     
             # Start worker threads
             threads = []
@@ -793,7 +817,7 @@ class StreamDownloader(QThread):
                 if not self.is_running:
                     active_workers.clear()
                     break
-                time.sleep(0.1)
+                time.sleep(0.5)
     
             # Clean shutdown
             active_workers.clear()
@@ -831,6 +855,43 @@ class StreamDownloader(QThread):
                     shutil.rmtree(self.temp_dir, ignore_errors=True)
                 except:
                     pass
+
+    def download_segment_with_retry(self, url, output_path):
+        domains = ['tralvoxmoon.xyz', 'velloxfire.pro']
+        rate_limiter = RateLimiter(max_per_second=2)
+        
+        for attempt in range(self.retry_count):
+            try:
+                rate_limiter.wait()
+                
+                for domain in domains:
+                    current_url = url.replace(urlparse(url).netloc, domain)
+                    
+                    if attempt > 0:
+                        time.sleep(1 * (2 ** (attempt - 1)))
+                    
+                    response = self.session.get(
+                        current_url,
+                        verify=False,
+                        timeout=30,
+                        stream=True
+                    )
+                    
+                    if response.status_code == 200:
+                        with open(output_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if not self.is_running:
+                                    return False
+                                if chunk:
+                                    f.write(chunk)
+                        return True
+                        
+            except Exception as e:
+                if attempt == self.retry_count - 1:
+                    raise e
+                continue
+                
+        raise Exception(f"Failed to download segment after {self.retry_count} attempts")
 
     def combine_segments(self, segment_files, output_file):
         try:
