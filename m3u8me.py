@@ -903,7 +903,7 @@ class StreamDownloader(QThread):
             temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
             output_file = f"{output_file}.{output_format}"
     
-            # STEP 1: Concatenate segments with progress tracking
+            # STEP 1: Concatenate segments
             self.progress_updated.emit(self.url, 80, "Combining segments...")
             
             with open(temp_file, 'wb') as outfile:
@@ -915,17 +915,30 @@ class StreamDownloader(QThread):
                     progress = min(80 + int((i / len(segment_files)) * 10), 89)
                     self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
     
-            # STEP 2: Convert with improved progress tracking and timeout handling
+            # STEP 2: Convert with optimized settings
             self.progress_updated.emit(self.url, 90, "Processing video...")
+    
+            # Determine encoding settings based on quality
+            if quality == 'Super Duper!':
+                preset = 'veryfast'  # Changed from slow/medium for better speed
+                crf = '20'
+            elif quality == 'WTF!!?':
+                preset = 'ultrafast'
+                crf = '28'
+            else:  # Ehh...
+                preset = 'veryfast'
+                crf = '23'
     
             cmd = [
                 'ffmpeg', '-y',
                 '-fflags', '+genpts+igndts',
                 '-i', temp_file,
                 '-c:v', 'libx264',
-                '-preset', 'medium',  # Changed from 'slow' for better performance
-                '-crf', '23',        # Balanced quality/size
+                '-preset', preset,
+                '-crf', crf,
+                '-c:a', 'aac',
                 '-movflags', '+faststart',
+                '-progress', 'pipe:1',  # Output progress to stdout
                 output_file
             ]
     
@@ -933,31 +946,32 @@ class StreamDownloader(QThread):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                bufsize=1
             )
     
-            # Add timeout handling
             start_time = time.time()
-            timeout = 3600  # 1 hour timeout
+            timeout = 1800  # 30 minute timeout
             last_progress_time = time.time()
-            progress_timeout = 300  # 5 minutes without progress
+            progress_timeout = 300  # 5 minute progress timeout
+            last_frame = 0
+            total_duration = None
     
             while True:
                 if not self.is_running:
                     process.terminate()
                     return False
     
-                # Check overall timeout
-                if time.time() - start_time > timeout:
+                # Check timeouts
+                current_time = time.time()
+                if current_time - start_time > timeout:
                     process.terminate()
-                    raise Exception("Processing timeout exceeded (1 hour)")
-    
-                # Check progress timeout
-                if time.time() - last_progress_time > progress_timeout:
+                    raise Exception("Processing timeout exceeded (30 minutes)")
+                if current_time - last_progress_time > progress_timeout:
                     process.terminate()
                     raise Exception("No progress detected for 5 minutes")
     
-                # Poll process
+                # Check if process completed
                 retcode = process.poll()
                 if retcode is not None:
                     if retcode != 0:
@@ -965,30 +979,43 @@ class StreamDownloader(QThread):
                         raise Exception(f"FFmpeg error: {stderr}")
                     break
     
-                # Read output for progress
-                output = process.stderr.readline()
-                if output:
-                    if 'frame=' in output:
-                        last_progress_time = time.time()
-                        try:
-                            frame = int(output.split('frame=')[1].split()[0])
-                            progress = min(90 + int(frame / 500), 99)
-                            self.progress_updated.emit(self.url, progress, f"Processing video... {progress}%")
-                        except:
-                            pass
+                # Read progress
+                output = process.stdout.readline()
+                if not output:
+                    continue
     
-                time.sleep(0.1)
+                if 'frame=' in output:
+                    last_progress_time = current_time
+                    try:
+                        frame = int(output.split('frame=')[1].split()[0])
+                        if frame > last_frame:  # Only update progress if frame count increased
+                            last_frame = frame
+                            # Cap progress at 99% until fully complete
+                            progress = min(90 + int((frame / 1000) * 9), 99)
+                            self.progress_updated.emit(
+                                self.url, 
+                                progress,
+                                f"Processing video... (Frame {frame})"
+                            )
+                    except:
+                        pass
     
-            # Verify the output file
-            if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
-                raise Exception("Output file is invalid")
+                time.sleep(0.1)  # Prevent CPU overuse
+    
+            # Final verification
+            if not os.path.exists(output_file):
+                raise Exception("Output file was not created")
+                
+            if os.path.getsize(output_file) < 1000:
+                raise Exception("Output file is too small - likely corrupted")
     
             self.progress_updated.emit(self.url, 100, "Processing complete!")
             return True
     
         except Exception as e:
             logger.error(f"Error combining segments: {str(e)}")
-            return False
+            raise  # Re-raise to handle in calling function
+            
         finally:
             try:
                 if os.path.exists(temp_file):
