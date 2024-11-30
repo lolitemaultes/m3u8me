@@ -1064,7 +1064,7 @@ class SettingsTab(QWidget):
         download_layout = QGridLayout()
         
         self.thread_spin = QSpinBox()
-        self.thread_spin.setRange(1, 16)
+        self.thread_spin.setRange(1, 30)
         self.thread_spin.setValue(16)
         download_layout.addWidget(QLabel("Download Threads:"), 0, 0)
         download_layout.addWidget(self.thread_spin, 0, 1)
