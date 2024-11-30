@@ -35,6 +35,13 @@ from urllib.parse import urljoin, urlparse, quote, quote_plus, urlencode
 from pathlib import Path
 from queue import Queue
 
+# Add these imports
+import warnings
+import urllib3
+
+# Disable SSL warnings
+warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
+
 import requests
 import m3u8
 import psutil
@@ -49,6 +56,17 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PyQt5.QtGui import QPalette, QColor, QFont, QIcon, QPixmap
+
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('m3u8me.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Add the function here
 def get_resource_path(relative_path):
@@ -89,79 +107,6 @@ class RateLimiter:
             self.last_call = time.time()
 
 rate_limiter = RateLimiter(max_per_second=2)
-
-class PluginManager:
-    def __init__(self):
-        self.plugins = {}
-        self.plugin_folder = Path("plugins")
-        self.plugin_folder.mkdir(exist_ok=True)
-        self.load_plugins()
-
-    def load_plugins(self):
-        """Load all plugins from the plugins directory."""
-        self.plugins = {}
-        for plugin_file in self.plugin_folder.glob("*.m3uplug"):
-            try:
-                spec = importlib.util.spec_from_file_location(
-                    plugin_file.stem, 
-                    plugin_file
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                
-                if hasattr(module, 'PLUGIN_INFO'):
-                    self.plugins[plugin_file.stem] = {
-                        'module': module,
-                        'info': module.PLUGIN_INFO,
-                        'path': plugin_file
-                    }
-            except Exception as e:
-                logger.error(f"Failed to load plugin {plugin_file}: {str(e)}")
-
-    def install_plugin(self, plugin_path):
-        """Install a plugin from a file."""
-        try:
-            plugin_file = Path(plugin_path)
-            if not plugin_file.suffix == '.m3uplug':
-                raise ValueError("Invalid plugin file")
-
-            # Verify plugin structure
-            spec = importlib.util.spec_from_file_location(
-                plugin_file.stem, 
-                plugin_file
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            if not hasattr(module, 'PLUGIN_INFO'):
-                raise ValueError("Invalid plugin format")
-
-            # Copy to plugins folder
-            dest = self.plugin_folder / plugin_file.name
-            shutil.copy2(plugin_file, dest)
-            
-            return True, "Plugin installed successfully"
-        except Exception as e:
-            return False, f"Failed to install plugin: {str(e)}"
-
-    def uninstall_plugin(self, plugin_name):
-        """Uninstall a plugin."""
-        try:
-            if plugin_name in self.plugins:
-                plugin_path = self.plugins[plugin_name]['path']
-                plugin_path.unlink()
-                del self.plugins[plugin_name]
-                return True, "Plugin uninstalled successfully"
-            return False, "Plugin not found"
-        except Exception as e:
-            return False, f"Failed to uninstall plugin: {str(e)}"
-
-    def get_installed_plugins(self):
-        """Get list of installed plugins."""
-        return {
-            name: plugin['info'] 
-            for name, plugin in self.plugins.items()
-        }
 
 class CustomStyle:
     @staticmethod
@@ -639,15 +584,15 @@ class StreamDownloader(QThread):
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Origin': 'https://tralvoxmoon.xyz',
-            'Referer': 'https://tralvoxmoon.xyz/',
             'Connection': 'keep-alive',
+            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-Site': 'same-origin',
             'Pragma': 'no-cache',
-            'Cache-Control': 'no-cache',
-            'TE': 'trailers'
+            'Cache-Control': 'no-cache'
         })
         
         adapter = requests.adapters.HTTPAdapter(
@@ -659,36 +604,138 @@ class StreamDownloader(QThread):
         session.mount('http://', adapter)
         session.mount('https://', adapter)
         return session
+    
+    def _try_domains(self, url):
+        """Try multiple domains for the same URL pattern"""
+        domains = ['droxonwave.site', 'noltrixfire91.live', 'velloxfire.pro']
+        parsed = urlparse(url)
+        path = parsed.path
+        
+        for domain in domains:
+            try:
+                domain_url = f'https://{domain}{path}'
+                headers = {
+                    **self.session.headers,
+                    'Origin': f'https://{domain}',
+                    'Referer': f'https://{domain}/',
+                    'Host': domain,
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+                
+                logger.debug(f"Trying domain: {domain_url}")
+                logger.debug(f"Using headers: {headers}")
+                
+                response = self.session.get(
+                    domain_url,
+                    headers=headers,
+                    verify=False,
+                    timeout=30,
+                    allow_redirects=True
+                )
+                
+                if response.status_code == 200:
+                    logger.debug(f"Success with domain: {domain}")
+                    return response
+                    
+            except Exception as e:
+                logger.debug(f"Failed with domain {domain}: {str(e)}")
+                continue
+                
+        raise Exception("All domains failed")
+    
+    def _get_domain_specific_headers(self, url):
+        """Get domain-specific headers based on the URL"""
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        
+        # Base headers
+        headers = dict(self.session.headers)
+        
+        # Add domain-specific headers
+        headers.update({
+            'Origin': f'https://{domain}',
+            'Referer': f'https://{domain}/',
+            'Host': domain
+        })
+        
+        return headers
+    
+    def _clean_url(self, url):
+        """Clean URL preserving special characters exactly as they appear"""
+        url = url.strip().rstrip(':')
+        # Keep the URL exactly as is, just clean up any trailing characters
+        return url
 
-    def stop(self):
-        self.is_running = False
+    def _get_stream_url(self, playlist, base_url):
+        """Extract and process stream URL based on quality settings"""
+        available_streams = []
+        
+        for p in playlist.playlists:
+            bandwidth = getattr(p.stream_info, 'bandwidth', 0)
+            resolution = getattr(p.stream_info, 'resolution', None)
+            
+            if resolution:
+                width, height = resolution
+                available_streams.append({
+                    'uri': self._clean_url(p.uri),
+                    'resolution': f"{width}x{height}",
+                    'height': height,
+                    'bandwidth': bandwidth
+                })
+            elif bandwidth:
+                available_streams.append({
+                    'uri': self._clean_url(p.uri),
+                    'resolution': f"Bandwidth: {bandwidth//1000}kbps",
+                    'height': 0,
+                    'bandwidth': bandwidth
+                })
 
+        if not available_streams:
+            raise Exception("No valid streams found in playlist")
+
+        # Sort streams by quality
+        available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
+
+        # Select stream based on quality setting
+        quality = self.settings.get('quality', 'Super Duper!')
+        if quality == 'Super Duper!':
+            selected_stream = next(
+                (s for s in available_streams if s['height'] == 1080), 
+                available_streams[0]
+            )
+        elif quality == 'WTF!!?':
+            selected_stream = available_streams[-1]
+        else:  # Ehh...
+            selected_stream = available_streams[len(available_streams)//2]
+
+        return selected_stream['uri']
+    
     def run(self):
         try:
             self.temp_dir = tempfile.mkdtemp()
             content = self.url.strip().rstrip(':')
             base_url = None
     
-            # Handle direct M3U8 content vs URL
+            # Handle direct M3U8 content
             if content.startswith('#EXTM3U'):
                 playlist = m3u8.loads(content)
+                # Get the first URL from the playlist
+                for line in content.split('\n'):
+                    if line.startswith('http'):
+                        base_url = line.strip()
+                        break
             else:
-                try:
-                    response = self.session.get(
-                        content,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    playlist = m3u8.loads(response.text)
-                    base_url = content
-                except Exception as e:
-                    raise Exception(f"Failed to fetch M3U8: {str(e)}")
+                base_url = content
+    
+            # Try to fetch with multiple domains
+            try:
+                response = self._try_domains(base_url)
+                playlist = m3u8.loads(response.text)
+            except Exception as e:
+                raise Exception(f"Failed to fetch M3U8: {str(e)}")
     
             # Handle multi-quality streams
             if not playlist.segments and playlist.playlists:
-                # Filter and sort playlists by resolution
                 available_streams = []
                 for p in playlist.playlists:
                     bandwidth = getattr(p.stream_info, 'bandwidth', 0)
@@ -701,13 +748,6 @@ class StreamDownloader(QThread):
                             'height': height,
                             'bandwidth': bandwidth
                         })
-                    elif bandwidth:
-                        available_streams.append({
-                            'uri': p.uri,
-                            'resolution': f"Bandwidth: {bandwidth//1000}kbps",
-                            'height': 0,
-                            'bandwidth': bandwidth
-                        })
     
                 if not available_streams:
                     raise Exception("No valid streams found in playlist")
@@ -715,8 +755,9 @@ class StreamDownloader(QThread):
                 # Sort by height and bandwidth
                 available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
     
-                # Quality selection based on settings
+                # Select quality based on settings
                 quality = self.settings.get('quality', 'Super Duper!')
+                selected_stream = None
                 if quality == 'Super Duper!':
                     selected_stream = next(
                         (s for s in available_streams if s['height'] == 1080), 
@@ -724,34 +765,24 @@ class StreamDownloader(QThread):
                     )
                 elif quality == 'WTF!!?':
                     selected_stream = available_streams[-1]
-                else:  # Ehh...
+                else:
                     selected_stream = available_streams[len(available_streams)//2]
     
-                # Resolve the playlist URL
                 selected_url = selected_stream['uri']
                 if not selected_url.startswith('http'):
-                    if base_url:
-                        base_path = '/'.join(base_url.split('/')[:-1])
-                        selected_url = f"{base_path}/{selected_url}"
-                    else:
-                        raise Exception("Cannot resolve relative URL for non-HTTP playlist")
+                    parsed_base = urlparse(base_url)
+                    base_path = '/'.join(parsed_base.path.split('/')[:-1])
+                    selected_url = f"https://{parsed_base.netloc}{base_path}/{selected_url}"
     
-                # Fetch the selected quality playlist
+                # Try to fetch selected quality stream with domain fallback
                 try:
-                    response = self.session.get(
-                        selected_url,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
+                    response = self._try_domains(selected_url)
                     playlist = m3u8.loads(response.text)
-                    base_url = selected_url
                 except Exception as e:
                     raise Exception(f"Failed to fetch quality stream: {str(e)}")
     
-            if not playlist.segments:
-                raise Exception("No segments found in the final playlist")
+                if not playlist.segments:
+                    raise Exception("No segments found in the playlist")
     
             # Prepare segment download queue and tracking
             segment_queue = queue.Queue()
@@ -878,7 +909,8 @@ class StreamDownloader(QThread):
                     pass
 
     def download_segment_with_retry(self, url, output_path):
-        domains = ['tralvoxmoon.xyz', 'velloxfire.pro']
+        """Enhanced segment download with better retry logic"""
+        domains = ['noltrixfire91.live', 'velloxfire.pro']
         rate_limiter = RateLimiter(max_per_second=2)
         
         for attempt in range(self.retry_count):
@@ -886,7 +918,10 @@ class StreamDownloader(QThread):
                 rate_limiter.wait()
                 
                 for domain in domains:
-                    current_url = url.replace(urlparse(url).netloc, domain)
+                    current_url = url
+                    if not current_url.startswith('http'):
+                        parsed_base = urlparse(self.url)
+                        current_url = f"{parsed_base.scheme}://{domain}/{current_url.lstrip('/')}"
                     
                     if attempt > 0:
                         time.sleep(1 * (2 ** (attempt - 1)))
@@ -895,10 +930,15 @@ class StreamDownloader(QThread):
                         current_url,
                         verify=False,
                         timeout=30,
-                        stream=True
+                        stream=True,
+                        allow_redirects=True,
+                        headers={
+                            **self.session.headers,
+                            'Range': 'bytes=0-'
+                        }
                     )
                     
-                    if response.status_code == 200:
+                    if response.status_code in [200, 206]:
                         with open(output_path, 'wb') as f:
                             for chunk in response.iter_content(chunk_size=8192):
                                 if not self.is_running:
@@ -906,8 +946,11 @@ class StreamDownloader(QThread):
                                 if chunk:
                                     f.write(chunk)
                         return True
+                    
+                    logger.debug(f"Attempt {attempt + 1} failed for domain {domain}: {response.status_code}")
                         
             except Exception as e:
+                logger.error(f"Download error on attempt {attempt + 1}: {str(e)}")
                 if attempt == self.retry_count - 1:
                     raise e
                 continue
@@ -922,8 +965,6 @@ class StreamDownloader(QThread):
             output_format = self.settings.get('output_format', 'mp4')
             quality = self.settings.get('quality', 'Super Duper!')
             temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
-            
-            # Use the new get_unique_filename function
             output_file = self.get_unique_filename(output_base, output_format)
     
             # STEP 1: Combine segments
@@ -940,15 +981,54 @@ class StreamDownloader(QThread):
     
             self.progress_updated.emit(self.url, 100, "Processing video...")
     
-            # STEP 2: Simple and reliable CPU encoding
+            # STEP 2: Analyze streams
+            probe_cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_streams',
+                temp_file
+            ]
+            
+            probe_result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True
+            )
+            
+            if probe_result.returncode != 0:
+                raise Exception("Failed to analyze media streams")
+                
+            streams_info = json.loads(probe_result.stdout)
+            
+            # Initialize FFmpeg command
             cmd = ['ffmpeg', '-y']
     
             # Input options
-            cmd.extend([
-                '-i', temp_file
-            ])
+            cmd.extend(['-i', temp_file])
     
-            # Quality-based settings
+            # Stream mapping
+            video_streams = []
+            audio_streams = []
+            subtitle_streams = []
+            
+            for stream in streams_info['streams']:
+                if stream['codec_type'] == 'video':
+                    video_streams.append(stream)
+                elif stream['codec_type'] == 'audio':
+                    audio_streams.append(stream)
+                elif stream['codec_type'] == 'subtitle':
+                    subtitle_streams.append(stream)
+    
+            # Map all streams
+            for i, stream in enumerate(video_streams):
+                cmd.extend(['-map', f'0:{stream["index"]}'])
+            for i, stream in enumerate(audio_streams):
+                cmd.extend(['-map', f'0:{stream["index"]}'])
+            for i, stream in enumerate(subtitle_streams):
+                cmd.extend(['-map', f'0:{stream["index"]}'])
+    
+            # Set codecs based on quality settings
             if quality == 'Super Duper!':
                 cmd.extend([
                     '-c:v', 'libx264',
@@ -968,10 +1048,33 @@ class StreamDownloader(QThread):
                     '-crf', '23'
                 ])
     
-            # Common output options
+            # Audio codec settings for all audio streams
             cmd.extend([
                 '-c:a', 'aac',
-                '-b:a', '128k',
+                '-b:a', '128k'
+            ])
+    
+            # Copy subtitles without re-encoding
+            if subtitle_streams:
+                cmd.extend(['-c:s', 'copy'])
+    
+            # Metadata for audio and subtitle streams
+            for i, stream in enumerate(audio_streams):
+                lang = stream.get('tags', {}).get('language', f'und_{i}')
+                cmd.extend([
+                    f'-metadata:s:a:{i}', f'language={lang}',
+                    f'-metadata:s:a:{i}', f'title=Audio Track {i+1}'
+                ])
+    
+            for i, stream in enumerate(subtitle_streams):
+                lang = stream.get('tags', {}).get('language', f'und_{i}')
+                cmd.extend([
+                    f'-metadata:s:s:{i}', f'language={lang}',
+                    f'-metadata:s:s:{i}', f'title=Subtitle Track {i+1}'
+                ])
+    
+            # Output options
+            cmd.extend([
                 '-movflags', '+faststart',
                 output_file
             ])
@@ -1052,7 +1155,6 @@ class StreamDownloader(QThread):
 class SettingsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.plugin_manager = PluginManager()
         self.original_settings = {}
         self.init_ui()
         self.load_settings()  # Load initial settings
@@ -1120,29 +1222,6 @@ class SettingsTab(QWidget):
         download_group.setLayout(download_layout)
         layout.addWidget(download_group)
 
-        # Plugin Management
-        plugin_group = QGroupBox("Plugin Management")
-        plugin_layout = QVBoxLayout()
-        
-        button_layout = QHBoxLayout()
-        install_btn = QPushButton("Install Plugin")
-        install_btn.clicked.connect(self.install_plugin)
-        refresh_btn = QPushButton("Refresh Plugins")
-        refresh_btn.clicked.connect(self.refresh_plugins)
-        button_layout.addWidget(install_btn)
-        button_layout.addWidget(refresh_btn)
-        plugin_layout.addLayout(button_layout)
-        
-        self.plugin_list = QScrollArea()
-        self.plugin_list.setWidgetResizable(True)
-        self.plugin_list_widget = QWidget()
-        self.plugin_list_layout = QVBoxLayout(self.plugin_list_widget)
-        self.plugin_list.setWidget(self.plugin_list_widget)
-        plugin_layout.addWidget(self.plugin_list)
-        
-        plugin_group.setLayout(plugin_layout)
-        layout.addWidget(plugin_group)
-
         # Output Settings
         output_group = QGroupBox("Output Settings")
         output_layout = QVBoxLayout()
@@ -1173,8 +1252,6 @@ class SettingsTab(QWidget):
         # Main layout for the tab
         main_layout = QVBoxLayout(self)
         main_layout.addWidget(scroll)
-        
-        self.refresh_plugins()
 
     def apply_preset(self, preset):
         if preset == 'High Quality':
@@ -1189,100 +1266,6 @@ class SettingsTab(QWidget):
             self.quality_combo.setCurrentText('Super Duper!')
             self.format_combo.setCurrentText('mp4')
             self.preserve_source_check.setChecked(True)
-
-    def install_plugin(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Plugin File",
-            "",
-            "M3U8ME Plugins (*.m3uplug)"
-        )
-        
-        if file_path:
-            success, message = self.plugin_manager.install_plugin(file_path)
-            
-            if success:
-                self.refresh_plugins()
-                reply = QMessageBox.question(
-                    self,
-                    "Plugin Installed",
-                    "Plugin installed successfully. Restart application to apply changes?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes
-                )
-                
-                if reply == QMessageBox.Yes:
-                    QApplication.quit()
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Installation Failed",
-                    message,
-                    QMessageBox.Ok
-                )
-
-    def refresh_plugins(self):
-        for i in reversed(range(self.plugin_list_layout.count())):
-            widget = self.plugin_list_layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-        
-        plugins = self.plugin_manager.get_installed_plugins()
-        for name, info in plugins.items():
-            plugin_widget = QFrame()
-            plugin_widget.setFrameStyle(QFrame.Box | QFrame.Raised)
-            plugin_layout = QHBoxLayout(plugin_widget)
-            
-            # Plugin info
-            info_layout = QVBoxLayout()
-            name_label = QLabel(f"<b>{info.get('name', name)}</b>")
-            desc_label = QLabel(info.get('description', 'No description'))
-            version_label = QLabel(f"Version: {info.get('version', '1.0')}")
-            
-            info_layout.addWidget(name_label)
-            info_layout.addWidget(desc_label)
-            info_layout.addWidget(version_label)
-            
-            # Uninstall button
-            uninstall_btn = QPushButton("Uninstall")
-            uninstall_btn.clicked.connect(
-                lambda n=name: self.uninstall_plugin(n)
-            )
-            
-            plugin_layout.addLayout(info_layout)
-            plugin_layout.addWidget(uninstall_btn)
-            
-            self.plugin_list_layout.addWidget(plugin_widget)
-        
-        self.plugin_list_layout.addStretch()
-
-    def uninstall_plugin(self, plugin_name):
-        reply = QMessageBox.question(
-            self,
-            "Confirm Uninstall",
-            f"Are you sure you want to uninstall {plugin_name}?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            success, message = self.plugin_manager.uninstall_plugin(plugin_name)
-            
-            if success:
-                self.refresh_plugins()
-                QMessageBox.information(
-                    self,
-                    "Plugin Uninstalled",
-                    "Plugin uninstalled successfully. Please restart the application.",
-                    QMessageBox.Ok
-                )
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Uninstall Failed",
-                    message,
-                    QMessageBox.Ok
-                )
 
     def check_settings_changed(self):
         """Check if current settings differ from original"""
@@ -1349,189 +1332,6 @@ class SettingsTab(QWidget):
         except:
             # If settings file doesn't exist or is invalid, use defaults
             pass
-
-class SearchWorker(QThread):
-    resultFound = pyqtSignal(dict)
-    searchComplete = pyqtSignal()
-    searchError = pyqtSignal(str)
-    progressUpdate = pyqtSignal(int, int)  # current, total
-
-    def __init__(self, query):
-        super().__init__()
-        self.query = query
-        self.is_running = True
-
-    def run(self):
-        try:
-            self.temp_dir = tempfile.mkdtemp()
-    
-            # Clean up the input
-            content = self.url.strip().rstrip(':')
-            
-            # Parse the M3U8 content
-            try:
-                playlist = m3u8.loads(content)
-            except Exception as e:
-                raise Exception(f"Failed to parse M3U8: {str(e)}")
-    
-            # Handle multi-quality streams
-            if not playlist.segments and playlist.playlists:
-                # Filter and sort playlists by resolution
-                available_streams = []
-                for p in playlist.playlists:
-                    if hasattr(p.stream_info, 'resolution'):
-                        width, height = p.stream_info.resolution
-                        bandwidth = p.stream_info.bandwidth
-                        available_streams.append({
-                            'playlist': p,
-                            'resolution': f"{width}x{height}",
-                            'height': height,
-                            'bandwidth': bandwidth,
-                            'uri': p.uri
-                        })
-    
-                # Sort by height and bandwidth (for same resolution)
-                available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
-    
-                # Quality selection based on settings
-                quality = self.settings.get('quality', 'best')
-                selected_stream = None
-    
-                if quality == 'best':
-                    # Look specifically for 1080p first
-                    for stream in available_streams:
-                        if stream['height'] == 1080:
-                            selected_stream = stream
-                            break
-                    # If no 1080p, take the highest available
-                    if not selected_stream and available_streams:
-                        selected_stream = available_streams[0]
-                elif quality == 'worst':
-                    selected_stream = available_streams[-1]
-                else:  # medium
-                    selected_stream = available_streams[len(available_streams)//2]
-    
-                if not selected_stream:
-                    raise Exception("No suitable quality stream found")
-    
-                selected_url = selected_stream['uri']
-                resolution = selected_stream['resolution']
-                
-                self.progress_updated.emit(
-                    self.url, 
-                    0, 
-                    f"Selected quality: {resolution} ({selected_stream['bandwidth'] // 1000}kbps)"
-                )
-    
-                try:
-                    response = self.session.get(
-                        selected_url,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    playlist = m3u8.loads(response.text)
-                except Exception as e:
-                    raise Exception(f"Failed to fetch quality stream: {str(e)}")
-    
-            if not playlist.segments:
-                raise Exception("No segments found in playlist")
-    
-            # Download segments
-            segment_files = []
-            total_segments = len(playlist.segments)
-            
-            for i, segment in enumerate(playlist.segments):
-                if not self.is_running:
-                    raise Exception("Download cancelled by user")
-    
-                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
-                segment_url = segment.uri
-    
-                # Ensure segment URL is absolute
-                if not segment_url.startswith('http'):
-                    base_url = os.path.dirname(selected_url) if 'selected_url' in locals() else ''
-                    segment_url = f"{base_url}/{segment_url}" if base_url else segment_url
-    
-                try:
-                    response = self.session.get(
-                        segment_url,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    
-                    with open(output_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    segment_files.append(output_path)
-                    progress = min(int((i / total_segments) * 80), 79)
-                    self.progress_updated.emit(
-                        self.url,
-                        progress,
-                        f"Downloading {resolution} segments... {i+1}/{total_segments}"
-                    )
-                    
-                except Exception as e:
-                    raise Exception(f"Failed to download segment {i+1}: {str(e)}")
-    
-            # Combine segments into intermediate file
-            self.progress_updated.emit(self.url, 80, "Combining segments...")
-            intermediate_file = os.path.join(self.temp_dir, "intermediate.ts")
-            
-            with open(intermediate_file, 'wb') as outfile:
-                for segment_file in segment_files:
-                    with open(segment_file, 'rb') as infile:
-                        outfile.write(infile.read())
-    
-            # Convert to desired format while preserving quality
-            self.progress_updated.emit(self.url, 90, f"Converting {resolution} video to final format...")
-            
-            output_format = self.settings.get('output_format', 'mp4')
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            quality_info = f"_{resolution}"
-            output_file = os.path.join(self.save_path, f"video_{timestamp}{quality_info}.{output_format}")
-    
-            # High quality conversion
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', intermediate_file,
-                '-c:v', 'copy',         # Copy video stream to preserve quality
-                '-c:a', 'aac',          # Convert audio to AAC for compatibility
-                '-b:a', '384k',         # High quality audio
-                '-movflags', '+faststart',  # Enable streaming
-                '-metadata', f'resolution={resolution}',  # Add resolution to metadata
-                output_file
-            ]
-    
-            process = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-    
-            if process.returncode != 0:
-                raise Exception(f"Failed to convert video: {process.stderr}")
-    
-            # Verify the output file
-            if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
-                raise Exception("Output file is invalid")
-    
-            self.progress_updated.emit(self.url, 100, f"Download complete! ({resolution})")
-            self.download_complete.emit(self.url)
-    
-        except Exception as e:
-            logger.error(f"Download error: {str(e)}")
-            self.download_error.emit(self.url, str(e))
-        finally:
-            if self.temp_dir and os.path.exists(self.temp_dir):
-                try:
-                    shutil.rmtree(self.temp_dir, ignore_errors=True)
-                except:
-                    pass
 
 class M3U8StreamDownloader(QMainWindow):
     def __init__(self):
@@ -1628,38 +1428,6 @@ class M3U8StreamDownloader(QMainWindow):
         # Set initial button states
         self.start_all_btn.setEnabled(False)
         self.stop_all_btn.setEnabled(False)
-
-    def create_buttons(self):
-        """Create control buttons and connect signals"""
-        # Add URL button
-        self.add_url_btn = QPushButton("Add URL")
-        self.add_url_btn.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
-        self.add_url_btn.setToolTip("Add a single URL to the download queue")
-        self.add_url_btn.clicked.connect(self.add_url_from_input)
-    
-        # Bulk upload button
-        self.bulk_upload_btn = QPushButton("Bulk Upload")
-        self.bulk_upload_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
-        self.bulk_upload_btn.setToolTip("Upload multiple URLs from a file")
-        self.bulk_upload_btn.clicked.connect(self.bulk_upload)
-    
-        # Control buttons
-        self.start_all_btn = QPushButton("Start All")
-        self.start_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.start_all_btn.setToolTip("Start all pending downloads")
-        self.start_all_btn.clicked.connect(self.start_all_downloads)
-        self.start_all_btn.setEnabled(False)
-    
-        self.stop_all_btn = QPushButton("Stop All")
-        self.stop_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_all_btn.setToolTip("Stop all active downloads")
-        self.stop_all_btn.clicked.connect(self.stop_all_downloads)
-        self.stop_all_btn.setEnabled(False)
-    
-        self.clear_completed_btn = QPushButton("Clear Completed")
-        self.clear_completed_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
-        self.clear_completed_btn.setToolTip("Remove completed downloads from the list")
-        self.clear_completed_btn.clicked.connect(self.clear_completed_downloads)
 
     def init_download_tab(self):
         layout = QVBoxLayout(self.download_tab)
