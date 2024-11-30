@@ -610,6 +610,27 @@ class StreamDownloader(QThread):
             'Pragma': 'no-cache',
             'Cache-Control': 'no-cache'
         }
+        
+    @staticmethod
+    def get_unique_filename(base_path, extension):
+        """
+        Generate a unique filename by appending a number if the file already exists.
+        
+        Args:
+            base_path (str): The base path and filename without extension
+            extension (str): The file extension (e.g., 'mp4', 'mkv')
+            
+        Returns:
+            str: A unique filepath that doesn't exist
+        """
+        counter = 1
+        output_file = f"{base_path}.{extension}"
+        
+        while os.path.exists(output_file):
+            output_file = f"{base_path}_{counter}.{extension}"
+            counter += 1
+            
+        return output_file
 
     def _configure_session(self):
         session = requests.Session()
@@ -892,8 +913,8 @@ class StreamDownloader(QThread):
                 continue
                 
         raise Exception(f"Failed to download segment after {self.retry_count} attempts")
-
-    def combine_segments(self, segment_files, output_file):
+    
+    def combine_segments(self, segment_files, output_base):
         try:
             if not shutil.which('ffmpeg'):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
@@ -901,7 +922,9 @@ class StreamDownloader(QThread):
             output_format = self.settings.get('output_format', 'mp4')
             quality = self.settings.get('quality', 'Super Duper!')
             temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
-            output_file = f"{output_file}.{output_format}"
+            
+            # Use the new get_unique_filename function
+            output_file = self.get_unique_filename(output_base, output_format)
     
             # STEP 1: Combine segments
             self.progress_updated.emit(self.url, 0, "Combining segments...")
