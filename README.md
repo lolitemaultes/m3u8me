@@ -7,7 +7,7 @@ M3U8me is a user-friendly tool that helps you download and convert M3U8 streams 
 ## 🐛 Known Issues
 
 1. **Segment Merging**:
-   - M3U8 URLs are currently unretreivable from the search page.
+   - Some stream downloads can be choppy at the moment.
    - TS and MKV files have not been tested and may be problematic.
 
 2. **Limited Features**:
