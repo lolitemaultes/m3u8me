@@ -18,6 +18,7 @@ import sys
 import os
 import json
 import re
+import queue
 import time
 import logging
 import tempfile
@@ -48,6 +49,16 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtNetwork import QLocalSocket, QLocalServer
 from PyQt5.QtGui import QPalette, QColor, QFont, QIcon, QPixmap
+
+# Add the function here
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # Set up logging
 logging.basicConfig(
@@ -566,48 +577,15 @@ class StreamDownloader(QThread):
         self.is_running = True
         self.temp_dir = None
         self.retry_count = settings.get('retry_attempts', 3)
-        self.max_concurrent_segments = self._calculate_optimal_workers()
-        self.chunk_size = self._calculate_optimal_chunk_size()
-        self.segment_queue = deque()
-        self.download_lock = threading.Lock()
-        self.progress_lock = threading.Lock()
-        self.completed_segments = set()
+        self.max_concurrent_segments = settings.get('max_workers', 30)
         self.session = self._configure_session()
         
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': '*/*',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'Connection': 'keep-alive'
         }
-
-    def _calculate_optimal_workers(self):
-        try:
-            cpu_count = psutil.cpu_count(logical=False) or 2
-            memory = psutil.virtual_memory()
-            available_memory_gb = memory.available / (1024 * 1024 * 1024)
-            cpu_based = cpu_count * 2
-            memory_based = int(available_memory_gb * 4)
-            optimal_workers = min(cpu_based, memory_based)
-            return max(4, min(optimal_workers, 64))
-        except:
-            return 8
-
-    def _calculate_optimal_chunk_size(self):
-        try:
-            memory = psutil.virtual_memory()
-            available_memory_mb = memory.available / (1024 * 1024)
-            if available_memory_mb > 8192:
-                return 4 * 1024 * 1024
-            elif available_memory_mb > 4096:
-                return 2 * 1024 * 1024
-            else:
-                return 1 * 1024 * 1024
-        except:
-            return 1 * 1024 * 1024
 
     def _configure_session(self):
         session = requests.Session()
@@ -619,86 +597,240 @@ class StreamDownloader(QThread):
         )
         session.mount('http://', adapter)
         session.mount('https://', adapter)
-        session.timeout = (5, 30)
         return session
 
-    def download_segment(self, segment_url, output_path, index, total):
-        temp_path = f"{output_path}.temp"
-        
-        for attempt in range(self.retry_count):
-            try:
-                if not self.is_running:
-                    return False
+    def stop(self):
+        self.is_running = False
 
-                if segment_url.startswith('//'):
-                    segment_url = 'https:' + segment_url
-                elif not segment_url.startswith('http'):
-                    if not segment_url.startswith('/'):
-                        segment_url = '/' + segment_url
-                    parsed_parent = urlparse(self.url)
-                    segment_url = f"{parsed_parent.scheme}://{parsed_parent.netloc}{segment_url}"
-
-                with self.session.get(
-                    segment_url,
-                    headers=self.headers,
-                    timeout=self.settings.get('segment_timeout', 30),
-                    verify=False,
-                    stream=True
-                ) as response:
+    def run(self):
+        try:
+            self.temp_dir = tempfile.mkdtemp()
+            content = self.url.strip().rstrip(':')
+            base_url = None
+    
+            # Handle direct M3U8 content vs URL
+            if content.startswith('#EXTM3U'):
+                playlist = m3u8.loads(content)
+            else:
+                try:
+                    response = self.session.get(
+                        content,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
                     response.raise_for_status()
-                    total_size = int(response.headers.get('content-length', 0))
-                    downloaded_size = 0
+                    playlist = m3u8.loads(response.text)
+                    base_url = content
+                except Exception as e:
+                    raise Exception(f"Failed to fetch M3U8: {str(e)}")
+    
+            # Handle multi-quality streams
+            if not playlist.segments and playlist.playlists:
+                # Filter and sort playlists by resolution
+                available_streams = []
+                for p in playlist.playlists:
+                    bandwidth = getattr(p.stream_info, 'bandwidth', 0)
+                    resolution = getattr(p.stream_info, 'resolution', None)
+                    if resolution:
+                        width, height = resolution
+                        available_streams.append({
+                            'uri': p.uri,
+                            'resolution': f"{width}x{height}",
+                            'height': height,
+                            'bandwidth': bandwidth
+                        })
+                    elif bandwidth:
+                        available_streams.append({
+                            'uri': p.uri,
+                            'resolution': f"Bandwidth: {bandwidth//1000}kbps",
+                            'height': 0,
+                            'bandwidth': bandwidth
+                        })
+    
+                if not available_streams:
+                    raise Exception("No valid streams found in playlist")
+    
+                # Sort by height and bandwidth
+                available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
+    
+                # Quality selection based on settings
+                quality = self.settings.get('quality', 'Super Duper!')
+                if quality == 'Super Duper!':
+                    selected_stream = next(
+                        (s for s in available_streams if s['height'] == 1080), 
+                        available_streams[0]
+                    )
+                elif quality == 'WTF!!?':
+                    selected_stream = available_streams[-1]
+                else:  # Ehh...
+                    selected_stream = available_streams[len(available_streams)//2]
+    
+                # Resolve the playlist URL
+                selected_url = selected_stream['uri']
+                if not selected_url.startswith('http'):
+                    if base_url:
+                        base_path = '/'.join(base_url.split('/')[:-1])
+                        selected_url = f"{base_path}/{selected_url}"
+                    else:
+                        raise Exception("Cannot resolve relative URL for non-HTTP playlist")
+    
+                # Fetch the selected quality playlist
+                try:
+                    response = self.session.get(
+                        selected_url,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    playlist = m3u8.loads(response.text)
+                    base_url = selected_url
+                except Exception as e:
+                    raise Exception(f"Failed to fetch quality stream: {str(e)}")
+    
+            if not playlist.segments:
+                raise Exception("No segments found in the final playlist")
+    
+            # Prepare segment download queue and tracking
+            segment_queue = queue.Queue()
+            results = {}
+            failed_segments = set()
+            download_errors = []
+            completed_segments = 0
+            
+            # Thread-safe counter using Lock
+            counter_lock = threading.Lock()
+            
+            def increment_counter():
+                nonlocal completed_segments
+                with counter_lock:
+                    completed_segments += 1
+                    return completed_segments
+    
+            # Populate queue
+            for i, segment in enumerate(playlist.segments):
+                segment_url = segment.uri
+                if not segment_url.startswith('http'):
+                    if base_url:
+                        base_path = '/'.join(base_url.split('/')[:-1])
+                        segment_url = f"{base_path}/{segment_url}"
                     
-                    with open(temp_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=self.chunk_size):
-                            if not self.is_running:
-                                return False
-                            if chunk:
-                                f.write(chunk)
-                                downloaded_size += len(chunk)
-                                
-                                if total_size > 0:
-                                    segment_progress = int((downloaded_size / total_size) * 100)
-                                    with self.progress_lock:
-                                        self.progress_updated.emit(
-                                            self.url,
-                                            int((index + segment_progress/100) / total * 90),
-                                            f"Downloading segment {index + 1}/{total}"
-                                        )
-
-                if os.path.exists(temp_path):
-                    file_size = os.path.getsize(temp_path)
-                    if file_size < 100:
-                        raise Exception(f"Segment {index} is too small: {file_size} bytes")
-                    
-                    os.replace(temp_path, output_path)
-                    
-                    with self.download_lock:
-                        self.completed_segments.add(index)
-                        progress = int(len(self.completed_segments) / total * 90)
-                        self.progress_updated.emit(
-                            self.url,
-                            progress,
-                            f"Downloaded {len(self.completed_segments)}/{total} segments"
-                        )
-                    return True
-                else:
-                    raise Exception(f"Failed to download segment {index}")
-
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1}/{self.retry_count} failed for segment {index}: {str(e)}")
-                if attempt < self.retry_count - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                return False
-            finally:
-                if os.path.exists(temp_path):
+                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
+                segment_queue.put((i, segment_url, output_path))
+                results[i] = None
+    
+            total_segments = len(playlist.segments)
+            max_workers = min(self.max_concurrent_segments, total_segments)
+            active_workers = threading.Event()
+            active_workers.set()
+    
+            def download_worker():
+                while active_workers.is_set():
                     try:
-                        os.remove(temp_path)
-                    except:
-                        pass
-                        
-        return False
+                        try:
+                            i, segment_url, output_path = segment_queue.get(timeout=1)  # 1 second timeout
+                        except queue.Empty:
+                            continue  # Keep trying until active_workers is cleared
+    
+                        try:
+                            response = self.session.get(
+                                segment_url,
+                                headers=self.headers,
+                                verify=False,
+                                timeout=30,
+                                stream=True
+                            )
+                            response.raise_for_status()
+    
+                            with open(output_path, 'wb') as f:
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    if not active_workers.is_set():
+                                        return
+                                    if chunk:
+                                        f.write(chunk)
+    
+                            # Verify segment size
+                            if os.path.getsize(output_path) < 100:
+                                raise Exception(f"Segment {i} is too small")
+    
+                            results[i] = output_path
+                            current_completed = increment_counter()
+    
+                            # Update progress
+                            progress = min(int((current_completed / total_segments) * 80), 79)
+                            self.progress_updated.emit(
+                                self.url,
+                                progress,
+                                f"Downloading segments... {current_completed}/{total_segments} ({max_workers} threads)"
+                            )
+    
+                        except Exception as e:
+                            with counter_lock:
+                                failed_segments.add(i)
+                                download_errors.append(f"Segment {i}: {str(e)}")
+    
+                        finally:
+                            segment_queue.task_done()
+    
+                    except Exception as e:
+                        logger.error(f"Worker thread error: {str(e)}")
+                        continue  # Keep trying until active_workers is cleared
+    
+            # Start worker threads
+            threads = []
+            for _ in range(max_workers):
+                thread = threading.Thread(target=download_worker)
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+    
+            # Wait for downloads to complete
+            while active_workers.is_set():
+                total_processed = completed_segments + len(failed_segments)
+                if total_processed >= total_segments:
+                    break
+                if not self.is_running:
+                    active_workers.clear()
+                    break
+                time.sleep(0.1)
+    
+            # Clean shutdown
+            active_workers.clear()
+            for thread in threads:
+                thread.join(timeout=2)
+    
+            if not self.is_running:
+                raise Exception("Download cancelled by user")
+    
+            if failed_segments:
+                raise Exception(f"Failed to download {len(failed_segments)} segments:\n" + 
+                              "\n".join(download_errors[:5]) +
+                              (f"\n... and {len(download_errors) - 5} more errors" if len(download_errors) > 5 else ""))
+    
+            # Get ordered list of segment files
+            segment_files = [results[i] for i in range(total_segments) if i not in failed_segments]
+    
+            if not segment_files:
+                raise Exception("No segments were downloaded successfully")
+    
+            # Combine segments
+            self.progress_updated.emit(self.url, 80, "Combining segments...")
+            if not self.combine_segments(segment_files, os.path.join(self.save_path, "output")):
+                raise Exception("Failed to combine segments")
+    
+            self.progress_updated.emit(self.url, 100, "Download complete!")
+            self.download_complete.emit(self.url)
+    
+        except Exception as e:
+            logger.error(f"Download error: {str(e)}")
+            self.download_error.emit(self.url, str(e))
+        finally:
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                try:
+                    shutil.rmtree(self.temp_dir, ignore_errors=True)
+                except:
+                    pass
 
     def combine_segments(self, segment_files, output_file):
         try:
@@ -706,10 +838,11 @@ class StreamDownloader(QThread):
                 raise Exception("FFmpeg not found. Please install FFmpeg to continue.")
     
             output_format = self.settings.get('output_format', 'mp4')
+            quality = self.settings.get('quality', 'Super Duper!')
             temp_file = os.path.join(self.temp_dir, f"temp_fixed.ts")
             output_file = f"{output_file}.{output_format}"
     
-            # STEP 1: Concatenate all segments to a single TS file first
+            # STEP 1: Concatenate segments with progress tracking
             self.progress_updated.emit(self.url, 0, "Combining segments...")
             
             with open(temp_file, 'wb') as outfile:
@@ -719,31 +852,60 @@ class StreamDownloader(QThread):
                     progress = min(int((i / len(segment_files)) * 50), 49)
                     self.progress_updated.emit(self.url, progress, f"Combining segments... {progress}%")
     
-            # STEP 2: Convert to final format with fixed timing
-            self.progress_updated.emit(self.url, 50, "Fixing video timing...")
+            # STEP 2: Convert with quality preservation
+            self.progress_updated.emit(self.url, 50, "Processing video...")
     
+            # Base command with input
             cmd = [
                 'ffmpeg', '-y',
-                '-i', temp_file,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',  # Speed over compression
-                '-tune', 'zerolatency',  # Minimize latency
-                '-profile:v', 'baseline', # Better compatibility
-                '-level', '3.0',
-                '-x264opts', 'no-scenecut', # Prevent frame analysis
-                '-flags', '+cgop',  # Consistent GOP
-                '-r', '30',  # Force 30fps
-                '-g', '30',  # One keyframe per second
-                '-keyint_min', '30',  # Force regular keyframes
-                '-sc_threshold', '0',  # Disable scene change detection
-                '-bf', '0',  # No B-frames
-                '-vsync', 'cfr',  # Constant frame rate
-                '-async', '1',  # Audio sync
-                '-copytb', '1',
-                '-enc_time_base', 'fixed',
-                '-video_track_timescale', '90000',
-                output_file
+                '-fflags', '+genpts+igndts',
+                '-i', temp_file
             ]
+    
+            # Quality-specific encoding parameters
+            if quality == 'Super Duper!':
+                # High quality - minimal compression
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'slow',          # Better compression
+                    '-crf', '18',              # High quality (lower value = higher quality)
+                    '-profile:v', 'high',
+                    '-level', '4.1',
+                    '-c:a', 'aac',
+                    '-b:a', '320k',            # High quality audio
+                ])
+            elif quality == 'WTF!!?':
+                # Low quality - maximum compression
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-crf', '28',              # Lower quality
+                    '-profile:v', 'baseline',
+                    '-level', '3.0',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',            # Lower quality audio
+                ])
+            else:  # Ehh...
+                # Medium quality - balanced
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-crf', '23',              # Medium quality
+                    '-profile:v', 'main',
+                    '-level', '4.0',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',            # Medium quality audio
+                ])
+    
+            # Common parameters for all quality levels
+            cmd.extend([
+                '-max_muxing_queue_size', '1024',
+                '-vsync', 'passthrough',
+                '-copyts',
+                '-start_at_zero',
+                '-movflags', '+faststart',
+                output_file
+            ])
     
             process = subprocess.Popen(
                 cmd,
@@ -764,13 +926,14 @@ class StreamDownloader(QThread):
                 if 'frame=' in output:
                     try:
                         frame = int(output.split('frame=')[1].split()[0])
-                        progress = min(50 + int(frame / 500), 99)  # Rough estimate
-                        self.progress_updated.emit(self.url, progress, f"Fixing video timing... {progress}%")
+                        progress = min(50 + int(frame / 500), 99)
+                        self.progress_updated.emit(self.url, progress, f"Processing video... {progress}%")
                     except:
                         pass
     
             if process.returncode != 0:
-                raise Exception("Failed to fix video timing")
+                _, stderr = process.communicate()
+                raise Exception(f"FFmpeg error: {stderr}")
     
             # Verify the output file
             if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
@@ -783,239 +946,11 @@ class StreamDownloader(QThread):
             logger.error(f"Error combining segments: {str(e)}")
             return False
         finally:
-            # Cleanup
             try:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
             except:
                 pass
-    
-    def get_total_duration(self, segment_files):
-        """Calculate total duration of all segments"""
-        try:
-            total_duration = 0
-            for segment in segment_files:
-                cmd = [
-                    'ffprobe',
-                    '-v', 'error',
-                    '-show_entries', 'format=duration',
-                    '-of', 'default=noprint_wrappers=1:nokey=1',
-                    segment
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    duration = float(result.stdout.strip())
-                    total_duration += duration
-            return total_duration
-        except:
-            return 0
-    
-    def verify_video_file(self, file_path):
-        """Verify the output video file is valid"""
-        try:
-            cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-select_streams', 'v:0',
-                '-show_entries', 'stream=codec_type',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                file_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return result.returncode == 0 and 'video' in result.stdout.strip()
-        except:
-            return False
-            
-    def estimate_remaining_time(self, processed_seconds, total_duration):
-        if total_duration == 0 or processed_seconds == 0:
-            return "calculating..."
-            
-        elapsed = time.time() - self.processing_started
-        if elapsed < 2:  # Need some time to get accurate estimation
-            return "calculating..."
-            
-        rate = processed_seconds / elapsed
-        if rate == 0:
-            return "calculating..."
-            
-        remaining_seconds = (total_duration - processed_seconds) / rate
-        
-        if remaining_seconds < 60:
-            return f"{int(remaining_seconds)}s"
-        else:
-            return str(timedelta(seconds=int(remaining_seconds)))
-
-    def run(self):
-        try:
-            self.temp_dir = tempfile.mkdtemp()
-    
-            # Clean up the input
-            content = self.url.strip().rstrip(':')
-            
-            # Parse the M3U8 content
-            try:
-                playlist = m3u8.loads(content)
-            except Exception as e:
-                raise Exception(f"Failed to parse M3U8: {str(e)}")
-    
-            # Handle multi-quality streams
-            if not playlist.segments and playlist.playlists:
-                # Filter and sort playlists by resolution
-                available_streams = []
-                for p in playlist.playlists:
-                    if hasattr(p.stream_info, 'resolution'):
-                        width, height = p.stream_info.resolution
-                        bandwidth = p.stream_info.bandwidth
-                        available_streams.append({
-                            'playlist': p,
-                            'resolution': f"{width}x{height}",
-                            'height': height,
-                            'bandwidth': bandwidth,
-                            'uri': p.uri
-                        })
-    
-                # Sort by height and bandwidth (for same resolution)
-                available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
-    
-                # Quality selection based on settings
-                quality = self.settings.get('quality', 'Super Duper!')
-                selected_stream = None
-    
-                if quality == 'Super Duper!':
-                    # Look specifically for 1080p first
-                    for stream in available_streams:
-                        if stream['height'] == 1080:
-                            selected_stream = stream
-                            break
-                    # If no 1080p, take the highest available
-                    if not selected_stream and available_streams:
-                        selected_stream = available_streams[0]
-                elif quality == 'WTF!!?':
-                    selected_stream = available_streams[-1]
-                else:  # Ehh...
-                    selected_stream = available_streams[len(available_streams)//2]
-    
-                if not selected_stream:
-                    raise Exception("No suitable quality stream found")
-    
-                selected_url = selected_stream['uri']
-                resolution = selected_stream['resolution']
-                
-                self.progress_updated.emit(
-                    self.url, 
-                    0, 
-                    f"Selected quality: {resolution} ({selected_stream['bandwidth'] // 1000}kbps)"
-                )
-    
-                try:
-                    response = self.session.get(
-                        selected_url,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    playlist = m3u8.loads(response.text)
-                except Exception as e:
-                    raise Exception(f"Failed to fetch quality stream: {str(e)}")
-    
-            if not playlist.segments:
-                raise Exception("No segments found in playlist")
-    
-            # Download segments
-            segment_files = []
-            total_segments = len(playlist.segments)
-            
-            for i, segment in enumerate(playlist.segments):
-                if not self.is_running:
-                    raise Exception("Download cancelled by user")
-    
-                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
-                segment_url = segment.uri
-    
-                # Ensure segment URL is absolute
-                if not segment_url.startswith('http'):
-                    base_url = os.path.dirname(selected_url) if 'selected_url' in locals() else ''
-                    segment_url = f"{base_url}/{segment_url}" if base_url else segment_url
-    
-                try:
-                    response = self.session.get(
-                        segment_url,
-                        headers=self.headers,
-                        verify=False,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    
-                    with open(output_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    segment_files.append(output_path)
-                    progress = min(int((i / total_segments) * 80), 79)
-                    self.progress_updated.emit(
-                        self.url,
-                        progress,
-                        f"Downloading {resolution} segments... {i+1}/{total_segments}"
-                    )
-                    
-                except Exception as e:
-                    raise Exception(f"Failed to download segment {i+1}: {str(e)}")
-    
-            # Combine segments into intermediate file
-            self.progress_updated.emit(self.url, 80, "Combining segments...")
-            intermediate_file = os.path.join(self.temp_dir, "intermediate.ts")
-            
-            with open(intermediate_file, 'wb') as outfile:
-                for segment_file in segment_files:
-                    with open(segment_file, 'rb') as infile:
-                        outfile.write(infile.read())
-    
-            # Convert to desired format while preserving quality
-            self.progress_updated.emit(self.url, 90, f"Converting {resolution} video to final format...")
-            
-            output_format = self.settings.get('output_format', 'mp4')
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            quality_info = f"_{resolution}"
-            output_file = os.path.join(self.save_path, f"video_{timestamp}{quality_info}.{output_format}")
-    
-            # High quality conversion
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', intermediate_file,
-                '-c:v', 'copy',         # Copy video stream to preserve quality
-                '-c:a', 'aac',          # Convert audio to AAC for compatibility
-                '-b:a', '384k',         # High quality audio
-                '-movflags', '+faststart',  # Enable streaming
-                '-metadata', f'resolution={resolution}',  # Add resolution to metadata
-                output_file
-            ]
-    
-            process = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-    
-            if process.returncode != 0:
-                raise Exception(f"Failed to convert video: {process.stderr}")
-    
-            # Verify the output file
-            if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
-                raise Exception("Output file is invalid")
-    
-            self.progress_updated.emit(self.url, 100, f"Download complete! ({resolution})")
-            self.download_complete.emit(self.url)
-    
-        except Exception as e:
-            logger.error(f"Download error: {str(e)}")
-            self.download_error.emit(self.url, str(e))
-        finally:
-            if self.temp_dir and os.path.exists(self.temp_dir):
-                try:
-                    shutil.rmtree(self.temp_dir, ignore_errors=True)
-                except:
-                    pass
 
 class SettingsTab(QWidget):
     def __init__(self, parent=None):
@@ -1331,78 +1266,175 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            options = Options()
-            options.add_argument('--headless')
-            options.add_argument('--disable-gpu')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
+            self.temp_dir = tempfile.mkdtemp()
+    
+            # Clean up the input
+            content = self.url.strip().rstrip(':')
             
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            # Parse the M3U8 content
             try:
-                search_url = f"https://freecinema.live/search?query={quote_plus(self.query)}"
-                logger.info(f"Loading search URL: {search_url}")
+                playlist = m3u8.loads(content)
+            except Exception as e:
+                raise Exception(f"Failed to parse M3U8: {str(e)}")
+    
+            # Handle multi-quality streams
+            if not playlist.segments and playlist.playlists:
+                # Filter and sort playlists by resolution
+                available_streams = []
+                for p in playlist.playlists:
+                    if hasattr(p.stream_info, 'resolution'):
+                        width, height = p.stream_info.resolution
+                        bandwidth = p.stream_info.bandwidth
+                        available_streams.append({
+                            'playlist': p,
+                            'resolution': f"{width}x{height}",
+                            'height': height,
+                            'bandwidth': bandwidth,
+                            'uri': p.uri
+                        })
+    
+                # Sort by height and bandwidth (for same resolution)
+                available_streams.sort(key=lambda x: (x['height'], x['bandwidth']), reverse=True)
+    
+                # Quality selection based on settings
+                quality = self.settings.get('quality', 'best')
+                selected_stream = None
+    
+                if quality == 'best':
+                    # Look specifically for 1080p first
+                    for stream in available_streams:
+                        if stream['height'] == 1080:
+                            selected_stream = stream
+                            break
+                    # If no 1080p, take the highest available
+                    if not selected_stream and available_streams:
+                        selected_stream = available_streams[0]
+                elif quality == 'worst':
+                    selected_stream = available_streams[-1]
+                else:  # medium
+                    selected_stream = available_streams[len(available_streams)//2]
+    
+                if not selected_stream:
+                    raise Exception("No suitable quality stream found")
+    
+                selected_url = selected_stream['uri']
+                resolution = selected_stream['resolution']
                 
-                driver.get(search_url)
-                
-                # Wait for results
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "movie-card"))
+                self.progress_updated.emit(
+                    self.url, 
+                    0, 
+                    f"Selected quality: {resolution} ({selected_stream['bandwidth'] // 1000}kbps)"
                 )
-                
-                # Get all movie cards
-                movie_cards = driver.find_elements(By.CLASS_NAME, "movie-card")
-                total_cards = len(movie_cards)
-                logger.info(f"Found {total_cards} movie cards")
-                
-                for i, card in enumerate(movie_cards):
-                    if not self.is_running:
-                        break
-                        
-                    try:
-                        # Extract movie information
-                        title = card.get_attribute('title')
-                        url = card.get_attribute('href')
-                        
-                        # Get poster
-                        try:
-                            img = card.find_element(By.CLASS_NAME, "movie-poster")
-                            poster_url = img.get_attribute('src')
-                        except:
-                            poster_url = None
-                            
-                        # Get year
-                        try:
-                            year = card.find_element(By.CLASS_NAME, "text-gray-300").text
-                        except:
-                            year = None
-                        
-                        if title and url:
-                            result = {
-                                'title': title,
-                                'url': url,
-                                'poster_url': poster_url,
-                                'year': year
-                            }
-                            
-                            self.resultFound.emit(result)
-                            self.progressUpdate.emit(i + 1, total_cards)
-                            logger.info(f"Found movie: {title}")
+    
+                try:
+                    response = self.session.get(
+                        selected_url,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    playlist = m3u8.loads(response.text)
+                except Exception as e:
+                    raise Exception(f"Failed to fetch quality stream: {str(e)}")
+    
+            if not playlist.segments:
+                raise Exception("No segments found in playlist")
+    
+            # Download segments
+            segment_files = []
+            total_segments = len(playlist.segments)
+            
+            for i, segment in enumerate(playlist.segments):
+                if not self.is_running:
+                    raise Exception("Download cancelled by user")
+    
+                output_path = os.path.join(self.temp_dir, f"segment_{i:05d}.ts")
+                segment_url = segment.uri
+    
+                # Ensure segment URL is absolute
+                if not segment_url.startswith('http'):
+                    base_url = os.path.dirname(selected_url) if 'selected_url' in locals() else ''
+                    segment_url = f"{base_url}/{segment_url}" if base_url else segment_url
+    
+                try:
+                    response = self.session.get(
+                        segment_url,
+                        headers=self.headers,
+                        verify=False,
+                        timeout=30
+                    )
+                    response.raise_for_status()
                     
-                    except Exception as e:
-                        logger.error(f"Error parsing movie card: {str(e)}")
-                        continue
-                
-                self.searchComplete.emit()
-                
-            finally:
-                driver.quit()
-                
+                    with open(output_path, 'wb') as f:
+                        f.write(response.content)
+                    
+                    segment_files.append(output_path)
+                    progress = min(int((i / total_segments) * 80), 79)
+                    self.progress_updated.emit(
+                        self.url,
+                        progress,
+                        f"Downloading {resolution} segments... {i+1}/{total_segments}"
+                    )
+                    
+                except Exception as e:
+                    raise Exception(f"Failed to download segment {i+1}: {str(e)}")
+    
+            # Combine segments into intermediate file
+            self.progress_updated.emit(self.url, 80, "Combining segments...")
+            intermediate_file = os.path.join(self.temp_dir, "intermediate.ts")
+            
+            with open(intermediate_file, 'wb') as outfile:
+                for segment_file in segment_files:
+                    with open(segment_file, 'rb') as infile:
+                        outfile.write(infile.read())
+    
+            # Convert to desired format while preserving quality
+            self.progress_updated.emit(self.url, 90, f"Converting {resolution} video to final format...")
+            
+            output_format = self.settings.get('output_format', 'mp4')
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            quality_info = f"_{resolution}"
+            output_file = os.path.join(self.save_path, f"video_{timestamp}{quality_info}.{output_format}")
+    
+            # High quality conversion
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', intermediate_file,
+                '-c:v', 'copy',         # Copy video stream to preserve quality
+                '-c:a', 'aac',          # Convert audio to AAC for compatibility
+                '-b:a', '384k',         # High quality audio
+                '-movflags', '+faststart',  # Enable streaming
+                '-metadata', f'resolution={resolution}',  # Add resolution to metadata
+                output_file
+            ]
+    
+            process = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+    
+            if process.returncode != 0:
+                raise Exception(f"Failed to convert video: {process.stderr}")
+    
+            # Verify the output file
+            if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
+                raise Exception("Output file is invalid")
+    
+            self.progress_updated.emit(self.url, 100, f"Download complete! ({resolution})")
+            self.download_complete.emit(self.url)
+    
         except Exception as e:
-            logger.error(f"Search error: {str(e)}")
-            self.searchError.emit(str(e))
-
-    def stop(self):
-        self.is_running = False
+            logger.error(f"Download error: {str(e)}")
+            self.download_error.emit(self.url, str(e))
+        finally:
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                try:
+                    shutil.rmtree(self.temp_dir, ignore_errors=True)
+                except:
+                    pass
 
 class M3U8StreamDownloader(QMainWindow):
     def __init__(self):
@@ -1464,7 +1496,7 @@ class M3U8StreamDownloader(QMainWindow):
         
         logo_label = QLabel()
         try:
-            logo_pixmap = QPixmap("/Resources/logo.png")
+            logo_pixmap = QPixmap(get_resource_path("Resources/m3u8me.png"))
             scaled_pixmap = logo_pixmap.scaled(480, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(scaled_pixmap)
         except:
@@ -1479,7 +1511,7 @@ class M3U8StreamDownloader(QMainWindow):
         layout.addWidget(logo_container)
 
         # Set up URL input
-        self.url_input.setPlaceholderText("URLs go here, or you can go away and bulk upload...")
+        self.url_input.setPlaceholderText("URLs go here, or you can piss off and bulk upload...")
         self.url_input.returnPressed.connect(self.add_url_from_input)
 
         # Initialize tabs
@@ -1539,7 +1571,7 @@ class M3U8StreamDownloader(QMainWindow):
         url_group = QGroupBox("Add Stream")
         url_layout = QHBoxLayout()
         
-        self.url_input.setPlaceholderText("URLs go here, or you can go away and bulk upload...")
+        self.url_input.setPlaceholderText("URLs go here, or you can piss off and bulk upload...")
         self.url_input.returnPressed.connect(self.add_url_from_input)
         url_layout.addWidget(self.url_input)
         url_layout.addWidget(self.add_url_btn)
