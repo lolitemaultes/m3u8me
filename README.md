@@ -2,7 +2,7 @@
 
 ## 📚 Overview
 
-M3U8me is a user-friendly tool that helps you download and convert M3U8 streams into MP4 files with ease. It's currently a work in progress, but more features are on the way.
+M3U8ME is a user-friendly tool that helps you download and convert M3U8 streams into MP4 files with ease. It's currently a work in progress, but more features are on the way.
 
 ## 🐛 Known Issues
 
@@ -12,7 +12,7 @@ M3U8me is a user-friendly tool that helps you download and convert M3U8 streams 
 
 2. **Limited Features**:
    - Functionality is currently minimal, but we're actively working on updates.
-   - Limited modification ability for M3U8me users.
+   - Limited modification ability for M3U8ME users.
 
 ## 🛠️ Upcoming Features
 
@@ -26,7 +26,7 @@ First version will release soon.
 
 ## 📥 Test M3U8 URLs
 
-Here's a curated list of M3U8 streams for testing with **M3U8me**. These URLs cover a variety of formats, including fMP4, live streams, and Dolby audio. Some URLs served over HTTP might require specific handling.
+Here's a curated list of M3U8 streams for testing with **M3U8ME**. These URLs cover a variety of formats, including fMP4, live streams, and Dolby audio. Some URLs served over HTTP might require specific handling.
 
 ### 🎥 Tears of Steel M3U8
 - [https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8](https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8)
@@ -63,4 +63,4 @@ Here's a curated list of M3U8 streams for testing with **M3U8me**. These URLs co
 
 ## 📌 Note
 
-Feel free to use these examples to test and experiment with **M3U8me**. Let us know if you encounter issues or have feedback!
+Feel free to use these examples to test and experiment with **M3U8ME**. Let us know if you encounter issues or have feedback!
