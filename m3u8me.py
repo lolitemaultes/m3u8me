@@ -62,7 +62,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('m3u8me.log'),
+        logging.FileHandler('Logs/m3u8me.log'),
         logging.StreamHandler()
     ]
 )
@@ -1325,7 +1325,7 @@ class SettingsTab(QWidget):
     def save_settings(self):
         settings = self.get_settings()
         try:
-            with open('m3u8_settings.json', 'w') as f:
+            with open('Settings/m3u8_settings.json', 'w') as f:
                 json.dump(settings, f)
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}")
@@ -1338,7 +1338,7 @@ class SettingsTab(QWidget):
 
     def load_settings(self):
         try:
-            with open('m3u8_settings.json', 'r') as f:
+            with open('Settings/m3u8_settings.json', 'r') as f:
                 settings = json.load(f)
                 
             self.quality_combo.setCurrentText(settings.get('quality', 'Super Duper!'))
@@ -1414,7 +1414,7 @@ class M3U8StreamDownloader(QMainWindow):
         
         logo_label = QLabel()
         try:
-            logo_pixmap = QPixmap(get_resource_path("Resources/m3u8me.png"))
+            logo_pixmap = QPixmap(get_resource_path("Resources/m3u8me/m3u8me.png"))
             scaled_pixmap = logo_pixmap.scaled(480, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(scaled_pixmap)
         except:
@@ -1958,21 +1958,6 @@ class M3U8StreamDownloader(QMainWindow):
 
     def save_settings(self):
         self.settings_tab.save_settings()
-
-    def closeEvent(self, event):
-        if self.force_quit:
-            self.save_settings()
-            self.stop_all_downloads()
-            event.accept()
-        else:
-            event.ignore()
-            self.hide()
-            self.tray_icon.showMessage(
-                "M3U8ME",
-                "Application minimized to tray. Double-click the tray icon to restore.",
-                QSystemTrayIcon.Information,
-                2000
-            )
 
 def handle_new_instance(server, window):
     socket = server.nextPendingConnection()
